@@ -1,9 +1,12 @@
 import hashlib
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO)
 from typing import Any
 
 import requests
@@ -38,6 +41,7 @@ from .schemas import (
     StaffMemberResponse,
     SurveyCTOImportRequest,
     SurveyCTOImportResponse,
+    SurveyCTOStatusResponse,
     TransformationResponse,
 )
 
@@ -136,6 +140,21 @@ def fetch_submission_payloads() -> list[dict[str, Any]]:
     for item in items:
         if isinstance(item, dict):
             normalized_items.append(item)
+
+    logging.info(
+        "SurveyCTO fetch: url=%s date=%s raw_items=%d normalized_items=%d",
+        url,
+        surveycto_date,
+        len(items),
+        len(normalized_items),
+    )
+    if normalized_items:
+        first_item = normalized_items[0]
+        logging.info(
+            "SurveyCTO first item keys: %s",
+            ", ".join(sorted(str(k) for k in first_item.keys())),
+        )
+
     return normalized_items
 
 
@@ -648,6 +667,35 @@ def get_admin_dashboard(db: Session = Depends(get_db)) -> AdminDashboardResponse
         medium_severity_count=medium_severity_count,
         staff_count=staff_count,
         last_sync_at=last_sync_at,
+    )
+
+
+@app.get("/api/admin/surveycto-status", response_model=SurveyCTOStatusResponse)
+def get_surveycto_status(db: Session = Depends(get_db)) -> SurveyCTOStatusResponse:
+    config = get_survey_platform_config()
+    raw_count = db.execute(select(func.count()).select_from(RawSurveyCTOSubmission)).scalar_one()
+    last_sync_at = db.execute(select(func.max(RawSurveyCTOSubmission.fetched_at))).scalar_one()
+
+    fetched_items = fetch_submission_payloads()
+    surveycto_raw_items = len(fetched_items)
+    surveycto_normalized_items = len(fetched_items)
+    first_item_keys = None
+    if fetched_items:
+        first_item_keys = sorted(str(k) for k in fetched_items[0].keys())
+
+    return SurveyCTOStatusResponse(
+        surveycto_server=config["server"],
+        surveycto_username=config["username"],
+        surveycto_main_form_id=config["form_id"],
+        surveycto_instrument_code=config["instrument_code"],
+        surveycto_date=config["date"],
+        surveycto_password_configured=bool(config["password"]),
+        surveycto_endpoint=f"https://{config['server']}.surveycto.com/api/v2/forms/data/wide/json/{config['form_id']}",
+        raw_submission_count=raw_count,
+        last_sync_at=last_sync_at,
+        surveycto_raw_items=surveycto_raw_items,
+        surveycto_normalized_items=surveycto_normalized_items,
+        surveycto_first_item_keys=first_item_keys,
     )
 
 

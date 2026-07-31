@@ -130,6 +130,21 @@ class AdminDashboardResponse(BaseModel):
     last_sync_at: datetime | None = None
 
 
+class SurveyCTOStatusResponse(BaseModel):
+    surveycto_server: str
+    surveycto_username: str
+    surveycto_main_form_id: str
+    surveycto_instrument_code: str
+    surveycto_date: str
+    surveycto_password_configured: bool
+    surveycto_endpoint: str
+    raw_submission_count: int
+    last_sync_at: datetime | None = None
+    surveycto_raw_items: int
+    surveycto_normalized_items: int
+    surveycto_first_item_keys: list[str] | None = None
+
+
 class ReprocessResponse(BaseModel):
     status: str
     submission_key: str
