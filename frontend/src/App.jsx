@@ -13,8 +13,14 @@ function App() {
   const [issues, setIssues] = useState([]);
   const [selectedIssue, setSelectedIssue] = useState(null);
   const [rawImports, setRawImports] = useState([]);
+  const [page, setPage] = useState('home');
+  const [syncStatus, setSyncStatus] = useState('');
+  const [dashboard, setDashboard] = useState(null);
+  const [staffMembers, setStaffMembers] = useState([]);
+  const [newStaff, setNewStaff] = useState({ username: '', email: '', role: 'reviewer' });
+  const [adminError, setAdminError] = useState('');
 
-  useEffect(() => {
+  const loadHomeData = () => {
     fetch(`${API_BASE}/api/qc/review-queue`)
       .then((response) => response.json())
       .then((data) => {
@@ -35,7 +41,67 @@ function App() {
       .catch(() => {
         setRawImports([]);
       });
+  };
+
+  const loadAdminData = () => {
+    setAdminError('');
+    fetch(`${API_BASE}/api/admin/dashboard`)
+      .then((response) => response.json())
+      .then((data) => setDashboard(data))
+      .catch(() => setDashboard(null));
+
+    fetch(`${API_BASE}/api/admin/staff`)
+      .then((response) => response.json())
+      .then((data) => setStaffMembers(data || []))
+      .catch(() => setStaffMembers([]));
+  };
+
+  useEffect(() => {
+    loadHomeData();
   }, []);
+
+  useEffect(() => {
+    if (page === 'admin') {
+      loadAdminData();
+    }
+  }, [page]);
+
+  const handleSync = () => {
+    setSyncStatus('Syncing...');
+    fetch(`${API_BASE}/api/import/survey-platform/sync`, { method: 'POST' })
+      .then((response) => response.json())
+      .then((data) => {
+        setSyncStatus(`Synced ${data.stored ?? 0} new submission(s)`);
+        loadHomeData();
+        if (page === 'admin') {
+          loadAdminData();
+        }
+      })
+      .catch(() => {
+        setSyncStatus('Sync failed. Check the backend connection and SurveyCTO configuration.');
+      });
+  };
+
+  const handleCreateStaff = (event) => {
+    event.preventDefault();
+    setAdminError('');
+    fetch(`${API_BASE}/api/admin/staff`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newStaff),
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error('Create staff failed');
+        return response.json();
+      })
+      .then((created) => {
+        setStaffMembers((current) => [...current, created]);
+        setNewStaff({ username: '', email: '', role: 'reviewer' });
+      })
+      .catch(() => {
+        setAdminError('Unable to add staff. Check the email and try again.');
+      });
+  };
 
   const stats = useMemo(() => {
     const highSeverity = issues.filter((issue) => issue.severity?.toLowerCase() === 'high').length;
@@ -59,7 +125,119 @@ function App() {
   return (
     <div style={{ fontFamily: 'Arial, sans-serif', background: '#f3f4f6', minHeight: '100vh', color: '#111827' }}>
       <div style={{ maxWidth: 1280, margin: '0 auto', padding: 24 }}>
-        <section
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+          <div>
+            <button
+              onClick={() => setPage('home')}
+              style={{
+                padding: '12px 18px',
+                marginRight: 10,
+                borderRadius: 12,
+                border: page === 'home' ? '2px solid #2563eb' : '1px solid #d1d5db',
+                background: page === 'home' ? '#eff6ff' : '#ffffff',
+                cursor: 'pointer',
+                fontWeight: 700,
+              }}
+            >
+              Home
+            </button>
+            <button
+              onClick={() => setPage('admin')}
+              style={{
+                padding: '12px 18px',
+                borderRadius: 12,
+                border: page === 'admin' ? '2px solid #2563eb' : '1px solid #d1d5db',
+                background: page === 'admin' ? '#eff6ff' : '#ffffff',
+                cursor: 'pointer',
+                fontWeight: 700,
+              }}
+            >
+              Admin Portal
+            </button>
+          </div>
+          <button
+            onClick={handleSync}
+            style={{ padding: '12px 18px', borderRadius: 12, border: 'none', background: '#2563eb', color: '#ffffff', cursor: 'pointer', fontWeight: 700 }}
+          >
+            Sync SurveyCTO
+          </button>
+        </div>
+
+        {page === 'admin' ? (
+          <section style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.8fr', gap: 24, marginBottom: 24 }}>
+            <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+              <h1 style={{ marginTop: 0 }}>Admin Dashboard</h1>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 14, marginBottom: 24 }}>
+                {[
+                  { label: 'Raw submissions', value: dashboard?.raw_submission_count ?? 0, accent: '#1d4ed8' },
+                  { label: 'Open issues', value: dashboard?.issue_count ?? 0, accent: '#dc2626' },
+                  { label: 'Pending review', value: dashboard?.pending_review_count ?? 0, accent: '#059669' },
+                  { label: 'High severity', value: dashboard?.high_severity_count ?? 0, accent: '#d97706' },
+                  { label: 'Medium severity', value: dashboard?.medium_severity_count ?? 0, accent: '#f59e0b' },
+                  { label: 'Staff members', value: dashboard?.staff_count ?? 0, accent: '#2563eb' },
+                ].map((metric) => (
+                  <div key={metric.label} style={{ background: '#f8fafc', borderRadius: 16, padding: 18 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: '#6b7280', marginBottom: 10 }}>{metric.label}</div>
+                    <div style={{ fontSize: 32, fontWeight: 800, color: metric.accent }}>{metric.value}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ color: '#6b7280' }}>
+                Last sync: {dashboard?.last_sync_at ? formatDate(dashboard.last_sync_at) : 'Not available'}
+              </div>
+            </div>
+
+            <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+              <h2 style={{ marginTop: 0 }}>Staff management</h2>
+              <form onSubmit={handleCreateStaff} style={{ display: 'grid', gap: 14, marginBottom: 18 }}>
+                <input
+                  value={newStaff.username}
+                  onChange={(e) => setNewStaff({ ...newStaff, username: e.target.value })}
+                  placeholder="Name"
+                  style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }}
+                />
+                <input
+                  value={newStaff.email}
+                  onChange={(e) => setNewStaff({ ...newStaff, email: e.target.value })}
+                  placeholder="Email"
+                  type="email"
+                  style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }}
+                />
+                <select
+                  value={newStaff.role}
+                  onChange={(e) => setNewStaff({ ...newStaff, role: e.target.value })}
+                  style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }}
+                >
+                  <option value="reviewer">Reviewer</option>
+                  <option value="admin">Admin</option>
+                </select>
+                <button style={{ padding: '12px 16px', borderRadius: 12, border: 'none', background: '#10b981', color: '#ffffff', fontWeight: 700, cursor: 'pointer' }}>
+                  Add staff
+                </button>
+                {adminError && <div style={{ color: '#b91c1c' }}>{adminError}</div>}
+              </form>
+              <div style={{ maxHeight: 420, overflow: 'auto' }}>
+                {staffMembers.length === 0 ? (
+                  <div style={{ color: '#6b7280', padding: 14, borderRadius: 12, border: '1px dashed #cbd5e1' }}>
+                    No staff configured yet.
+                  </div>
+                ) : (
+                  staffMembers.map((member) => (
+                    <div key={member.staff_id} style={{ display: 'flex', justifyContent: 'space-between', padding: 14, borderRadius: 12, background: '#f9fafb', marginBottom: 10 }}>
+                      <div>
+                        <strong>{member.username}</strong>
+                        <div style={{ color: '#4b5563', fontSize: 13 }}>{member.email}</div>
+                      </div>
+                      <div style={{ color: '#2563eb', fontWeight: 700 }}>{member.role}</div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </section>
+        ) : (
+          <>
+            <section
           style={{
             display: 'grid',
             gridTemplateColumns: '1.15fr 0.85fr',

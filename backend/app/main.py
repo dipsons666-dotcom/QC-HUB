@@ -9,12 +9,22 @@ from typing import Any
 import requests
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, create_schemas, get_db, get_engine
-from .models import ImportJob, IssueQueue, MainCase, RawSurveyCTOSubmission, RuleDefinition, RuleResult
+from .models import (
+    ImportJob,
+    IssueQueue,
+    MainCase,
+    RawSurveyCTOSubmission,
+    RuleDefinition,
+    RuleResult,
+    StaffMember,
+)
 from .schemas import (
+    AdminDashboardResponse,
     IssueActionRequest,
     ProcessingResponse,
     QCResultResponse,
@@ -24,6 +34,8 @@ from .schemas import (
     ReviewQueueResponse,
     RuleDefinitionCreate,
     RuleDefinitionResponse,
+    StaffMemberCreate,
+    StaffMemberResponse,
     SurveyCTOImportRequest,
     SurveyCTOImportResponse,
     TransformationResponse,
@@ -367,8 +379,10 @@ def transform_next_import(db: Session = Depends(get_db)) -> TransformationRespon
     if not isinstance(case_payload, dict):
         case_payload = {}
 
-    answers = case_payload.get("answers") if isinstance(case_payload.get("answers"), dict) else {}
-    gps = case_payload.get("gps") if isinstance(case_payload.get("gps"), dict) else {}
+    answers_candidate = case_payload.get("answers")
+    answers = answers_candidate if isinstance(answers_candidate, dict) else {}
+    gps_candidate = case_payload.get("gps")
+    gps = gps_candidate if isinstance(gps_candidate, dict) else {}
     transformed_payload = {
         "submission_id": job.submission_key,
         "project_id": job.instrument_code,
@@ -567,6 +581,73 @@ def get_review_queue(db: Session = Depends(get_db)) -> ReviewQueueResponse:
             for issue in issues
         ],
         count=len(issues),
+    )
+
+
+@app.get("/api/admin/staff", response_model=list[StaffMemberResponse])
+def get_staff_members(db: Session = Depends(get_db)) -> list[StaffMemberResponse]:
+    staff_members = (
+        db.execute(select(StaffMember).order_by(StaffMember.created_at.asc())).scalars().all()
+    )
+    return [
+        StaffMemberResponse(
+            staff_id=member.staff_id,
+            username=member.username,
+            email=member.email,
+            role=member.role,
+            created_at=member.created_at,
+        )
+        for member in staff_members
+    ]
+
+
+@app.post("/api/admin/staff", response_model=StaffMemberResponse, status_code=201)
+def create_staff_member(payload: StaffMemberCreate, db: Session = Depends(get_db)) -> StaffMemberResponse:
+    staff_member = StaffMember(
+        username=payload.username.strip(),
+        email=payload.email.strip(),
+        role=payload.role.strip() or "reviewer",
+    )
+    db.add(staff_member)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="A staff member with that email already exists.")
+    db.refresh(staff_member)
+    return StaffMemberResponse(
+        staff_id=staff_member.staff_id,
+        username=staff_member.username,
+        email=staff_member.email,
+        role=staff_member.role,
+        created_at=staff_member.created_at,
+    )
+
+
+@app.get("/api/admin/dashboard", response_model=AdminDashboardResponse)
+def get_admin_dashboard(db: Session = Depends(get_db)) -> AdminDashboardResponse:
+    raw_count = db.execute(select(func.count()).select_from(RawSurveyCTOSubmission)).scalar_one()
+    issue_count = db.execute(select(func.count()).select_from(IssueQueue)).scalar_one()
+    pending_review_count = db.execute(
+        select(func.count()).select_from(IssueQueue).where(IssueQueue.issue_status == "pending_review")
+    ).scalar_one()
+    high_severity_count = db.execute(
+        select(func.count()).select_from(IssueQueue).where(IssueQueue.severity == "high")
+    ).scalar_one()
+    medium_severity_count = db.execute(
+        select(func.count()).select_from(IssueQueue).where(IssueQueue.severity == "medium")
+    ).scalar_one()
+    staff_count = db.execute(select(func.count()).select_from(StaffMember)).scalar_one()
+    last_sync_at = db.execute(select(func.max(RawSurveyCTOSubmission.fetched_at))).scalar_one()
+
+    return AdminDashboardResponse(
+        raw_submission_count=raw_count,
+        issue_count=issue_count,
+        pending_review_count=pending_review_count,
+        high_severity_count=high_severity_count,
+        medium_severity_count=medium_severity_count,
+        staff_count=staff_count,
+        last_sync_at=last_sync_at,
     )
 
 

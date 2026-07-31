@@ -106,6 +106,30 @@ class RawSurveyCTOListResponse(BaseModel):
     count: int
 
 
+class StaffMemberCreate(BaseModel):
+    username: str
+    email: str
+    role: str = "reviewer"
+
+
+class StaffMemberResponse(BaseModel):
+    staff_id: str
+    username: str
+    email: str
+    role: str
+    created_at: datetime
+
+
+class AdminDashboardResponse(BaseModel):
+    raw_submission_count: int
+    issue_count: int
+    pending_review_count: int
+    high_severity_count: int
+    medium_severity_count: int
+    staff_count: int
+    last_sync_at: datetime | None = None
+
+
 class ReprocessResponse(BaseModel):
     status: str
     submission_key: str
