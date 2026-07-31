@@ -3,6 +3,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
@@ -55,12 +56,17 @@ def get_db():
 def create_schemas():
     engine = get_engine()
     if engine.dialect.name == "postgresql":
-        with engine.begin() as connection:
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS raw")
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS clean")
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS qc")
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS app")
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS audit")
+        try:
+            with engine.begin() as connection:
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS raw")
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS clean")
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS qc")
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS app")
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS audit")
+        except IntegrityError:
+            # Render may boot multiple workers at once. If another worker has already
+            # created the named schemas, we should continue startup rather than crash.
+            pass
     else:
         # SQLite and other dialects do not support named schemas the same way.
         pass
