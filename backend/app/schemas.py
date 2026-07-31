@@ -134,6 +134,7 @@ class SurveyCTOStatusResponse(BaseModel):
     surveycto_server: str
     surveycto_username: str
     surveycto_main_form_id: str
+    surveycto_dataset_id: str | None = None
     surveycto_instrument_code: str
     surveycto_date: str
     surveycto_password_configured: bool

@@ -108,12 +108,13 @@ def get_survey_platform_config() -> dict[str, str]:
         "username": os.getenv("SURVEYCTO_USERNAME", ""),
         "password": os.getenv("SURVEYCTO_PASSWORD", ""),
         "form_id": os.getenv("SURVEYCTO_MAIN_FORM_ID", ""),
+        "dataset_id": os.getenv("SURVEYCTO_DATASET_ID", ""),
         "instrument_code": os.getenv("SURVEYCTO_INSTRUMENT_CODE", "main"),
         "date": os.getenv("SURVEYCTO_DATE", datetime.now(timezone.utc).strftime("%Y%m%d")),
     }
 
 
-def fetch_submission_payloads() -> list[dict[str, Any]]:
+def fetch_submission_payloads_from_form() -> list[dict[str, Any]]:
     config = get_survey_platform_config()
     if not config["server"] or not config["username"] or not config["password"] or not config["form_id"]:
         return []
@@ -166,10 +167,79 @@ def fetch_submission_payloads() -> list[dict[str, Any]]:
     return normalized_items
 
 
+def fetch_surveycto_dataset_records() -> list[dict[str, Any]]:
+    config = get_survey_platform_config()
+    if not config["server"] or not config["username"] or not config["password"] or not config["dataset_id"]:
+        return []
+
+    url = f"https://{config['server']}.surveycto.com/api/v2/datasets/{config['dataset_id']}/records"
+    all_items: list[dict[str, Any]] = []
+    next_cursor: str | None = None
+
+    while True:
+        params: dict[str, Any] = {"limit": 1000}
+        if next_cursor:
+            params["cursor"] = next_cursor
+
+        response = requests.get(
+            url,
+            auth=(config["username"], config["password"]),
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        if isinstance(payload, dict):
+            if isinstance(payload.get("data"), list):
+                page_items = payload["data"]
+            elif isinstance(payload.get("items"), list):
+                page_items = payload["items"]
+            else:
+                page_items = []
+            next_cursor = payload.get("nextCursor")
+        elif isinstance(payload, list):
+            page_items = payload
+            next_cursor = None
+        else:
+            page_items = []
+            next_cursor = None
+
+        normalized_page_items = [item for item in page_items if isinstance(item, dict)]
+        all_items.extend(normalized_page_items)
+
+        if not next_cursor or not page_items:
+            break
+
+    logging.info(
+        "SurveyCTO dataset fetch: url=%s dataset_id=%s raw_items=%d",
+        url,
+        config["dataset_id"],
+        len(all_items),
+    )
+    if all_items:
+        first_item = all_items[0]
+        logging.info(
+            "SurveyCTO dataset first item keys: %s",
+            ", ".join(sorted(str(k) for k in first_item.keys())),
+        )
+
+    return all_items
+
+
+def fetch_submission_payloads() -> list[dict[str, Any]]:
+    config = get_survey_platform_config()
+    if config["dataset_id"]:
+        return fetch_surveycto_dataset_records()
+    return fetch_submission_payloads_from_form()
+
+
 def fetch_submission_payloads_status() -> tuple[list[dict[str, Any]], bool, str | None]:
     config = get_survey_platform_config()
-    if not config["server"] or not config["username"] or not config["password"] or not config["form_id"]:
-        return [], False, "Missing SurveyCTO credentials or form configuration"
+    if not config["server"] or not config["username"] or not config["password"] or (
+        not config["dataset_id"] and not config["form_id"]
+    ):
+        return [], False, "Missing SurveyCTO credentials or form/dataset configuration"
 
     try:
         items = fetch_submission_payloads()
@@ -735,14 +805,21 @@ def get_surveycto_status(db: Session = Depends(get_db)) -> SurveyCTOStatusRespon
     else:
         pull_message = f"Connected and fetched {surveycto_raw_items} item(s)"
 
+    surveycto_endpoint = (
+        f"https://{config['server']}.surveycto.com/api/v2/datasets/{config['dataset_id']}/records"
+        if config["dataset_id"]
+        else f"https://{config['server']}.surveycto.com/api/v2/forms/data/wide/json/{config['form_id']}"
+    )
+
     return SurveyCTOStatusResponse(
         surveycto_server=config["server"],
         surveycto_username=config["username"],
         surveycto_main_form_id=config["form_id"],
+        surveycto_dataset_id=config["dataset_id"],
         surveycto_instrument_code=config["instrument_code"],
         surveycto_date=config["date"],
         surveycto_password_configured=bool(config["password"]),
-        surveycto_endpoint=f"https://{config['server']}.surveycto.com/api/v2/forms/data/wide/json/{config['form_id']}",
+        surveycto_endpoint=surveycto_endpoint,
         raw_submission_count=raw_count,
         last_sync_at=last_sync_at,
         surveycto_connection_ok=connection_ok,
