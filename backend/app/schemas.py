@@ -143,6 +143,10 @@ class SurveyCTOStatusResponse(BaseModel):
     surveycto_raw_items: int
     surveycto_normalized_items: int
     surveycto_first_item_keys: list[str] | None = None
+    surveycto_sync_stored: int
+    surveycto_sync_updated: int
+    surveycto_sync_skipped_submission_id: int
+    surveycto_sync_message: str | None = None
 
 
 class ReprocessResponse(BaseModel):

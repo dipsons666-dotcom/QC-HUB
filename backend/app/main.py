@@ -247,10 +247,15 @@ def import_surveycto(payload: SurveyCTOImportRequest, db: Session = Depends(get_
 def sync_survey_platform_submissions(db: Session = Depends(get_db)) -> dict[str, Any]:
     batch_size = max(1, int(os.getenv("SURVEYCTO_BATCH_SIZE", "100")))
     items = fetch_submission_payloads()[:batch_size]
+    fetched = len(items)
     stored = 0
+    updated = 0
+    skipped_submission_id = 0
+
     for item in items:
         submission_id = str(item.get("submission_id") or item.get("id") or item.get("KEY") or item.get("submissionkey") or "")
         if not submission_id:
+            skipped_submission_id += 1
             continue
 
         payload_data = item.get("data") or item.get("payload") or item
@@ -291,9 +296,17 @@ def sync_survey_platform_submissions(db: Session = Depends(get_db)) -> dict[str,
             existing_submission.raw_payload = payload_data
             existing_submission.source_hash = source_hash
             existing_submission.fetched_at = datetime.now(timezone.utc)
+            updated += 1
 
     db.commit()
-    return {"status": "synced", "source": "survey_platform", "stored": stored}
+    return {
+        "status": "synced",
+        "source": "survey_platform",
+        "fetched": fetched,
+        "stored": stored,
+        "updated": updated,
+        "skipped_submission_id": skipped_submission_id,
+    }
 
 
 @app.get("/api/import/survey-platform/raw", response_model=RawSurveyCTOListResponse)
