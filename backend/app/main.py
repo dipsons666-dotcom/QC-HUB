@@ -74,6 +74,7 @@ def get_survey_platform_config() -> dict[str, str]:
         "password": os.getenv("SURVEYCTO_PASSWORD", ""),
         "form_id": os.getenv("SURVEYCTO_MAIN_FORM_ID", ""),
         "instrument_code": os.getenv("SURVEYCTO_INSTRUMENT_CODE", "main"),
+        "date": os.getenv("SURVEYCTO_DATE", datetime.now(timezone.utc).strftime("%Y%m%d")),
     }
 
 
@@ -82,10 +83,15 @@ def fetch_submission_payloads() -> list[dict[str, Any]]:
     if not config["server"] or not config["username"] or not config["password"] or not config["form_id"]:
         return []
 
+    surveycto_date = str(config["date"]).strip()
+    if len(surveycto_date) != 8 or not surveycto_date.isdigit():
+        surveycto_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+
     url = f"https://{config['server']}.surveycto.com/api/v2/forms/data/wide/json/{config['form_id']}"
     response = requests.get(
         url,
         auth=(config["username"], config["password"]),
+        params={"date": surveycto_date},
         timeout=30,
     )
     response.raise_for_status()
