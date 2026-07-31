@@ -12,6 +12,7 @@ const workflowSteps = [
 function App() {
   const [issues, setIssues] = useState([]);
   const [selectedIssue, setSelectedIssue] = useState(null);
+  const [rawImports, setRawImports] = useState([]);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/qc/review-queue`)
@@ -24,6 +25,15 @@ function App() {
       .catch(() => {
         setIssues([]);
         setSelectedIssue(null);
+      });
+
+    fetch(`${API_BASE}/api/import/survey-platform/raw`)
+      .then((response) => response.json())
+      .then((data) => {
+        setRawImports(data.items || []);
+      })
+      .catch(() => {
+        setRawImports([]);
       });
   }, []);
 
@@ -111,6 +121,33 @@ function App() {
         </section>
 
         <section style={{ display: 'grid', gridTemplateColumns: '1fr 1.25fr', gap: 24 }}>
+          <div style={{ background: '#ffffff', borderRadius: 18, padding: 18, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <h2 style={{ margin: 0 }}>Raw SurveyCTO Pulls</h2>
+              <span style={{ color: '#6b7280', fontSize: 14 }}>{rawImports.length} items</span>
+            </div>
+
+            {rawImports.length === 0 ? (
+              <div style={{ border: '1px dashed #cbd5e1', borderRadius: 12, padding: 24, textAlign: 'center', color: '#6b7280' }}>
+                No raw SurveyCTO submissions have been pulled into the database yet.
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gap: 10, maxHeight: 420, overflow: 'auto' }}>
+                {rawImports.map((record) => (
+                  <div key={record.raw_submission_id} style={{ border: '1px solid #d1d5db', borderRadius: 12, padding: 12, background: '#f9fafb' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
+                      <strong>{record.submission_key}</strong>
+                      <span style={{ fontSize: 12, color: '#6b7280' }}>{record.instrument_code}</span>
+                    </div>
+                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', color: '#1f2937', fontSize: 12, lineHeight: 1.45 }}>
+                      {JSON.stringify(record.raw_payload, null, 2)}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           <div style={{ background: '#ffffff', borderRadius: 18, padding: 18, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
               <h2 style={{ margin: 0 }}>Review Queue</h2>

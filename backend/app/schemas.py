@@ -92,6 +92,20 @@ class IssueActionRequest(BaseModel):
     resolution_note: str | None = None
 
 
+class RawSurveyCTOItem(BaseModel):
+    raw_submission_id: str
+    instrument_code: str
+    submission_key: str
+    source_hash: str
+    fetched_at: datetime
+    raw_payload: dict[str, Any]
+
+
+class RawSurveyCTOListResponse(BaseModel):
+    items: list[RawSurveyCTOItem]
+    count: int
+
+
 class ReprocessResponse(BaseModel):
     status: str
     submission_key: str

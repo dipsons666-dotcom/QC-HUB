@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Test/runtime artifacts
+backend/tests/.pytest_db/
+backend/*.db
+backend/**/*.db
+backend/.env
+frontend/dist/
+frontend/node_modules/
+
+# Environment files
+.env
+.env.*
+
+# OS/editor
+.DS_Store
+Thumbs.db

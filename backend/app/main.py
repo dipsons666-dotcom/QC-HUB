@@ -17,6 +17,8 @@ from .schemas import (
     IssueActionRequest,
     ProcessingResponse,
     QCResultResponse,
+    RawSurveyCTOItem,
+    RawSurveyCTOListResponse,
     ReviewQueueItem,
     ReviewQueueResponse,
     RuleDefinitionCreate,
@@ -252,6 +254,31 @@ def sync_survey_platform_submissions(db: Session = Depends(get_db)) -> dict[str,
 
     db.commit()
     return {"status": "synced", "source": "survey_platform", "stored": stored}
+
+
+@app.get("/api/import/survey-platform/raw", response_model=RawSurveyCTOListResponse)
+def list_raw_survey_platform_submissions(db: Session = Depends(get_db)) -> RawSurveyCTOListResponse:
+    submissions = (
+        db.execute(
+            select(RawSurveyCTOSubmission)
+            .order_by(RawSurveyCTOSubmission.fetched_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+
+    items = [
+        RawSurveyCTOItem(
+            raw_submission_id=submission.raw_submission_id,
+            instrument_code=submission.instrument_code,
+            submission_key=submission.submission_key,
+            source_hash=submission.source_hash,
+            fetched_at=submission.fetched_at,
+            raw_payload=submission.raw_payload if isinstance(submission.raw_payload, dict) else {"value": submission.raw_payload},
+        )
+        for submission in submissions
+    ]
+    return RawSurveyCTOListResponse(items=items, count=len(items))
 
 
 @app.post("/api/import/process-next", response_model=ProcessingResponse)
