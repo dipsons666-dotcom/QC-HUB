@@ -140,6 +140,10 @@ class SurveyCTOStatusResponse(BaseModel):
     surveycto_endpoint: str
     raw_submission_count: int
     last_sync_at: datetime | None = None
+    surveycto_connection_ok: bool
+    surveycto_connection_message: str | None = None
+    surveycto_pull_ok: bool
+    surveycto_pull_message: str | None = None
     surveycto_raw_items: int
     surveycto_normalized_items: int
     surveycto_first_item_keys: list[str] | None = None

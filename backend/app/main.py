@@ -68,6 +68,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_last_surveycto_sync: dict[str, Any] = {
+    "stored": 0,
+    "updated": 0,
+    "skipped_submission_id": 0,
+    "message": None,
+    "timestamp": None,
+}
+
 
 @app.get("/health")
 def health_check() -> dict[str, str]:
@@ -156,6 +164,22 @@ def fetch_submission_payloads() -> list[dict[str, Any]]:
         )
 
     return normalized_items
+
+
+def fetch_submission_payloads_status() -> tuple[list[dict[str, Any]], bool, str | None]:
+    config = get_survey_platform_config()
+    if not config["server"] or not config["username"] or not config["password"] or not config["form_id"]:
+        return [], False, "Missing SurveyCTO credentials or form configuration"
+
+    try:
+        items = fetch_submission_payloads()
+        return items, True, None
+    except requests.exceptions.RequestException as exc:
+        logging.error("SurveyCTO connection failed: %s", exc)
+        return [], False, str(exc)
+    except ValueError as exc:
+        logging.error("SurveyCTO payload parsing failed: %s", exc)
+        return [], False, str(exc)
 
 
 def _evaluate_rule_against_case(case_record: dict[str, Any], rule_record: dict[str, Any]) -> tuple[bool, str]:
@@ -299,6 +323,13 @@ def sync_survey_platform_submissions(db: Session = Depends(get_db)) -> dict[str,
             updated += 1
 
     db.commit()
+
+    _last_surveycto_sync["stored"] = stored
+    _last_surveycto_sync["updated"] = updated
+    _last_surveycto_sync["skipped_submission_id"] = skipped_submission_id
+    _last_surveycto_sync["message"] = "Sync completed"
+    _last_surveycto_sync["timestamp"] = datetime.now(timezone.utc).isoformat()
+
     return {
         "status": "synced",
         "source": "survey_platform",
@@ -689,12 +720,20 @@ def get_surveycto_status(db: Session = Depends(get_db)) -> SurveyCTOStatusRespon
     raw_count = db.execute(select(func.count()).select_from(RawSurveyCTOSubmission)).scalar_one()
     last_sync_at = db.execute(select(func.max(RawSurveyCTOSubmission.fetched_at))).scalar_one()
 
-    fetched_items = fetch_submission_payloads()
+    fetched_items, connection_ok, connection_message = fetch_submission_payloads_status()
     surveycto_raw_items = len(fetched_items)
     surveycto_normalized_items = len(fetched_items)
     first_item_keys = None
     if fetched_items:
         first_item_keys = sorted(str(k) for k in fetched_items[0].keys())
+
+    pull_ok = connection_ok and surveycto_raw_items > 0
+    if not connection_ok:
+        pull_message = "Unable to connect to SurveyCTO"
+    elif surveycto_raw_items == 0:
+        pull_message = "Connected successfully, but no items were returned"
+    else:
+        pull_message = f"Connected and fetched {surveycto_raw_items} item(s)"
 
     return SurveyCTOStatusResponse(
         surveycto_server=config["server"],
@@ -706,9 +745,17 @@ def get_surveycto_status(db: Session = Depends(get_db)) -> SurveyCTOStatusRespon
         surveycto_endpoint=f"https://{config['server']}.surveycto.com/api/v2/forms/data/wide/json/{config['form_id']}",
         raw_submission_count=raw_count,
         last_sync_at=last_sync_at,
+        surveycto_connection_ok=connection_ok,
+        surveycto_connection_message=connection_message,
+        surveycto_pull_ok=pull_ok,
+        surveycto_pull_message=pull_message,
         surveycto_raw_items=surveycto_raw_items,
         surveycto_normalized_items=surveycto_normalized_items,
         surveycto_first_item_keys=first_item_keys,
+        surveycto_sync_stored=_last_surveycto_sync["stored"],
+        surveycto_sync_updated=_last_surveycto_sync["updated"],
+        surveycto_sync_skipped_submission_id=_last_surveycto_sync["skipped_submission_id"],
+        surveycto_sync_message=_last_surveycto_sync["message"],
     )
 
 
