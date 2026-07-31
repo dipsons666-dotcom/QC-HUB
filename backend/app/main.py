@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,20 +29,28 @@ from .schemas import (
     TransformationResponse,
 )
 
-app = FastAPI(title="QC Flags Platform", version="0.1.0")
+def _get_cors_origins() -> list[str]:
+    configured_origins = os.getenv("CORS_ALLOWED_ORIGINS", "")
+    if configured_origins.strip():
+        return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
+    return ["http://127.0.0.1:3000", "http://localhost:3000"]
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    create_schemas()
+    Base.metadata.create_all(bind=get_engine())
+    yield
+
+
+app = FastAPI(title="QC Flags Platform", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:3000", "http://localhost:3000"],
+    allow_origins=_get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def startup_event() -> None:
-    create_schemas()
-    Base.metadata.create_all(bind=get_engine())
 
 
 @app.get("/health")

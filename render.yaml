@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: qc-hub-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: "cd backend && pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "cd backend && gunicorn app.main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT"
+    envVars:
+      - key: PYTHONPATH
+        value: backend
+      - key: DATABASE_URL
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        value: "https://your-frontend.onrender.com"
+      - key: SURVEYCTO_SERVER
+        sync: false
+      - key: SURVEYCTO_USERNAME
+        sync: false
+      - key: SURVEYCTO_PASSWORD
+        sync: false
+      - key: SURVEYCTO_MAIN_FORM_ID
+        sync: false
