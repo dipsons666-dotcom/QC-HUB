@@ -4,7 +4,8 @@ from app.main import fetch_submission_payloads
 def test_fetch_submission_payloads_passes_surveycto_date_param(monkeypatch):
     captured = {}
 
-    def fake_get(url, auth=None, params=None, timeout=30):
+    def fake_post(url, auth=None, params=None, timeout=30):
+        captured["method"] = "post"
         captured["url"] = url
         captured["auth"] = auth
         captured["params"] = params
@@ -24,11 +25,12 @@ def test_fetch_submission_payloads_passes_surveycto_date_param(monkeypatch):
     monkeypatch.setenv("SURVEYCTO_PASSWORD", "Seun22ade#")
     monkeypatch.setenv("SURVEYCTO_MAIN_FORM_ID", "BHT_4_SEASONS_JULY_2026")
     monkeypatch.delenv("SURVEYCTO_DATE", raising=False)
-    monkeypatch.setattr("app.main.requests.get", fake_get)
+    monkeypatch.setattr("app.main.requests.post", fake_post)
 
     result = fetch_submission_payloads()
 
     assert result == []
+    assert captured["method"] == "post"
     assert captured["url"] == "https://inicio.surveycto.com/api/v2/forms/data/wide/json/BHT_4_SEASONS_JULY_2026"
     assert captured["auth"] == ("adesina.adeyemo@inicio-insights.com", "Seun22ade#")
     assert captured["params"]["date"]

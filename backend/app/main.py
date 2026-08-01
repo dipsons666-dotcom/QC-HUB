@@ -17,6 +17,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import Base, create_schemas, get_db, get_engine
+from .services.surveycto_credentials import (
+    create_surveycto_session,
+    resolve_surveycto_credentials,
+)
 from .models import (
     ImportJob,
     IssueQueue,
@@ -41,6 +45,8 @@ from .schemas import (
     StaffMemberResponse,
     SurveyCTOImportRequest,
     SurveyCTOImportResponse,
+    SurveyCTOSessionRequest,
+    SurveyCTOSessionResponse,
     SurveyCTOStatusResponse,
     TransformationResponse,
 )
@@ -102,20 +108,30 @@ def _hash_payload(payload: Any) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def get_survey_platform_config() -> dict[str, str]:
+def get_survey_platform_config(
+    session_token: str | None = None,
+    request_username: str | None = None,
+    request_password: str | None = None,
+    request_server: str | None = None,
+    request_form_id: str | None = None,
+) -> dict[str, str]:
+    username, password = resolve_surveycto_credentials(
+        session_token=session_token,
+        request_username=request_username,
+        request_password=request_password,
+    )
     return {
-        "server": os.getenv("SURVEYCTO_SERVER", ""),
-        "username": os.getenv("SURVEYCTO_USERNAME", ""),
-        "password": os.getenv("SURVEYCTO_PASSWORD", ""),
-        "form_id": os.getenv("SURVEYCTO_MAIN_FORM_ID", ""),
+        "server": request_server or os.getenv("SURVEYCTO_SERVER", ""),
+        "username": username,
+        "password": password,
+        "form_id": request_form_id or os.getenv("SURVEYCTO_MAIN_FORM_ID", ""),
         "dataset_id": os.getenv("SURVEYCTO_DATASET_ID", ""),
         "instrument_code": os.getenv("SURVEYCTO_INSTRUMENT_CODE", "main"),
         "date": os.getenv("SURVEYCTO_DATE", datetime.now(timezone.utc).strftime("%Y%m%d")),
     }
 
 
-def fetch_submission_payloads_from_form() -> list[dict[str, Any]]:
-    config = get_survey_platform_config()
+def fetch_submission_payloads_from_form(config: dict[str, str]) -> list[dict[str, Any]]:
     if not config["server"] or not config["username"] or not config["password"] or not config["form_id"]:
         return []
 
@@ -124,7 +140,7 @@ def fetch_submission_payloads_from_form() -> list[dict[str, Any]]:
         surveycto_date = datetime.now(timezone.utc).strftime("%Y%m%d")
 
     url = f"https://{config['server']}.surveycto.com/api/v2/forms/data/wide/json/{config['form_id']}"
-    response = requests.get(
+    response = requests.post(
         url,
         auth=(config["username"], config["password"]),
         params={"date": surveycto_date},
@@ -167,8 +183,7 @@ def fetch_submission_payloads_from_form() -> list[dict[str, Any]]:
     return normalized_items
 
 
-def fetch_surveycto_dataset_records() -> list[dict[str, Any]]:
-    config = get_survey_platform_config()
+def fetch_surveycto_dataset_records(config: dict[str, str]) -> list[dict[str, Any]]:
     if not config["server"] or not config["username"] or not config["password"] or not config["dataset_id"]:
         return []
 
@@ -227,11 +242,12 @@ def fetch_surveycto_dataset_records() -> list[dict[str, Any]]:
     return all_items
 
 
-def fetch_submission_payloads() -> list[dict[str, Any]]:
-    config = get_survey_platform_config()
+def fetch_submission_payloads(config: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    if config is None:
+        config = get_survey_platform_config()
     if config["dataset_id"]:
-        return fetch_surveycto_dataset_records()
-    return fetch_submission_payloads_from_form()
+        return fetch_surveycto_dataset_records(config)
+    return fetch_submission_payloads_from_form(config)
 
 
 def fetch_submission_payloads_status() -> tuple[list[dict[str, Any]], bool, str | None]:
@@ -242,7 +258,7 @@ def fetch_submission_payloads_status() -> tuple[list[dict[str, Any]], bool, str 
         return [], False, "Missing SurveyCTO credentials or form/dataset configuration"
 
     try:
-        items = fetch_submission_payloads()
+        items = fetch_submission_payloads(config)
         return items, True, None
     except requests.exceptions.RequestException as exc:
         logging.error("SurveyCTO connection failed: %s", exc)
@@ -337,10 +353,40 @@ def import_surveycto(payload: SurveyCTOImportRequest, db: Session = Depends(get_
     )
 
 
+@app.post("/api/surveycto/session", response_model=SurveyCTOSessionResponse)
+def create_surveycto_session_endpoint(payload: SurveyCTOSessionRequest) -> SurveyCTOSessionResponse:
+    config = get_survey_platform_config(
+        request_server=payload.surveyctoServer,
+        request_username=payload.surveyctoUsername,
+        request_password=payload.surveyctoPassword,
+        request_form_id=payload.formId,
+    )
+    session = create_surveycto_session(
+        server=config["server"],
+        surveycto_username=config["username"],
+        surveycto_password=config["password"],
+        target_form_id=config["form_id"],
+    )
+    return SurveyCTOSessionResponse(**session)
+
+
 @app.post("/api/import/survey-platform/sync")
-def sync_survey_platform_submissions(db: Session = Depends(get_db)) -> dict[str, Any]:
+def sync_survey_platform_submissions(
+    payload: SurveyCTOSessionRequest | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     batch_size = max(1, int(os.getenv("SURVEYCTO_BATCH_SIZE", "100")))
-    items = fetch_submission_payloads()[:batch_size]
+    if payload is not None:
+        config = get_survey_platform_config(
+            session_token=payload.surveyctoSessionToken,
+            request_username=payload.surveyctoUsername,
+            request_password=payload.surveyctoPassword,
+            request_server=payload.surveyctoServer,
+            request_form_id=payload.formId,
+        )
+        items = fetch_submission_payloads(config)[:batch_size]
+    else:
+        items = fetch_submission_payloads()[:batch_size]
     fetched = len(items)
     stored = 0
     updated = 0

@@ -130,6 +130,19 @@ class AdminDashboardResponse(BaseModel):
     last_sync_at: datetime | None = None
 
 
+class SurveyCTOSessionRequest(BaseModel):
+    surveyctoServer: str | None = None
+    surveyctoUsername: str | None = None
+    surveyctoPassword: str | None = None
+    surveyctoSessionToken: str | None = None
+    formId: str | None = None
+
+
+class SurveyCTOSessionResponse(BaseModel):
+    token: str
+    expiresInSeconds: int
+
+
 class SurveyCTOStatusResponse(BaseModel):
     surveycto_server: str
     surveycto_username: str

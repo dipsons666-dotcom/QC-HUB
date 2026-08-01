@@ -1,0 +1,18 @@
+{
+  "python.terminal.useEnvFile": true,
+  "python.envFile": "${workspaceFolder}/backend/.env",
+  "sqltools.connections": [
+    {
+      "ssh": "Disabled",
+      "previewLimit": 50,
+      "server": "localhost",
+      "port": 5432,
+      "driver": "PostgreSQL",
+      "name": "PG Local",
+      "database": "qc_hub",
+      "username": "postgres",
+      "password": "@Tunji900",
+      "connectionTimeout": 30
+    }
+  ]
+}

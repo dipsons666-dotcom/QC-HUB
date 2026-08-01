@@ -1,0 +1,13 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Confirm backend env file path",
+			"type": "shell",
+			"command": "echo backend/.env exists: && if (Test-Path backend/.env) { echo yes } else { echo no }",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
