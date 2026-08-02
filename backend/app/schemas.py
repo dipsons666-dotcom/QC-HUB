@@ -106,6 +106,20 @@ class RawSurveyCTOListResponse(BaseModel):
     count: int
 
 
+class RawDataTableColumn(BaseModel):
+    name: str
+    type: str
+
+
+class RawDataTableResponse(BaseModel):
+    columns: list[RawDataTableColumn]
+    rows: list[dict[str, Any]]
+    count: int
+    limit: int
+    offset: int
+    has_more: bool
+
+
 class StaffMemberCreate(BaseModel):
     username: str
     email: str

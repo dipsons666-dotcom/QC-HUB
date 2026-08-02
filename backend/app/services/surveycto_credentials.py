@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import requests
 from fastapi import HTTPException
 
+from app.schemas import SurveyCTOSessionResponse
+
 _SURVEYCTO_SESSION_TTL_SECONDS = 2 * 60 * 60
 
 
@@ -35,7 +37,7 @@ def create_surveycto_session(
     surveycto_username: str,
     surveycto_password: str,
     target_form_id: str,
-) -> dict[str, str | int]:
+) -> SurveyCTOSessionResponse:
     username = surveycto_username.strip()
     password = surveycto_password.strip()
 
@@ -77,7 +79,7 @@ def create_surveycto_session(
         created_at=now,
         expires_at=now + _SURVEYCTO_SESSION_TTL_SECONDS,
     )
-    return {"token": token, "expiresInSeconds": _SURVEYCTO_SESSION_TTL_SECONDS}
+    return SurveyCTOSessionResponse(token=token, expiresInSeconds=_SURVEYCTO_SESSION_TTL_SECONDS)
 
 
 def resolve_surveycto_credentials(

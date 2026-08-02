@@ -10,7 +10,8 @@ logging.basicConfig(level=logging.INFO)
 from typing import Any
 
 import requests
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -49,6 +50,8 @@ from .schemas import (
     SurveyCTOSessionResponse,
     SurveyCTOStatusResponse,
     TransformationResponse,
+    RawDataTableColumn,
+    RawDataTableResponse,
 )
 
 def _get_cors_origins() -> list[str]:
@@ -56,6 +59,13 @@ def _get_cors_origins() -> list[str]:
     if configured_origins.strip():
         return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
     return ["http://127.0.0.1:3000", "http://localhost:3000"]
+
+
+def _get_cors_origin_regex() -> str | None:
+    configured_regex = os.getenv("CORS_ALLOWED_ORIGIN_REGEX", "")
+    if configured_regex.strip():
+        return configured_regex.strip()
+    return r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$"
 
 
 @asynccontextmanager
@@ -69,6 +79,7 @@ app = FastAPI(title="QC Flags Platform", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_get_cors_origins(),
+    allow_origin_regex=_get_cors_origin_regex(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -250,6 +261,25 @@ def fetch_submission_payloads(config: dict[str, str] | None = None) -> list[dict
     return fetch_submission_payloads_from_form(config)
 
 
+def _flatten_payload_for_table(payload: Any, prefix: str = "") -> dict[str, Any]:
+    if isinstance(payload, dict):
+        flattened: dict[str, Any] = {}
+        for key, value in payload.items():
+            field_name = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                flattened.update(_flatten_payload_for_table(value, field_name))
+            elif isinstance(value, list):
+                flattened[field_name] = json.dumps(value, ensure_ascii=False, default=str)
+            else:
+                flattened[field_name] = value
+        return flattened
+
+    if isinstance(payload, list):
+        return {prefix or "value": json.dumps(payload, ensure_ascii=False, default=str)}
+
+    return {prefix or "value": payload}
+
+
 def fetch_submission_payloads_status() -> tuple[list[dict[str, Any]], bool, str | None]:
     config = get_survey_platform_config()
     if not config["server"] or not config["username"] or not config["password"] or (
@@ -361,13 +391,12 @@ def create_surveycto_session_endpoint(payload: SurveyCTOSessionRequest) -> Surve
         request_password=payload.surveyctoPassword,
         request_form_id=payload.formId,
     )
-    session = create_surveycto_session(
+    return create_surveycto_session(
         server=config["server"],
         surveycto_username=config["username"],
         surveycto_password=config["password"],
         target_form_id=config["form_id"],
     )
-    return SurveyCTOSessionResponse(**session)
 
 
 @app.post("/api/import/survey-platform/sync")
@@ -800,6 +829,129 @@ def create_staff_member(payload: StaffMemberCreate, db: Session = Depends(get_db
         email=staff_member.email,
         role=staff_member.role,
         created_at=staff_member.created_at,
+    )
+
+
+@app.get("/api/admin/raw-data-table", response_model=RawDataTableResponse)
+def get_admin_raw_data_table(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    search: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> RawDataTableResponse:
+    total_count = db.execute(select(func.count()).select_from(RawSurveyCTOSubmission)).scalar_one()
+    submissions = (
+        db.execute(
+            select(RawSurveyCTOSubmission)
+            .order_by(RawSurveyCTOSubmission.fetched_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+
+    core_columns = [
+        ("submission_key", "string"),
+        ("instrument_code", "string"),
+        ("fetched_at", "datetime"),
+        ("raw_submission_id", "string"),
+        ("source_hash", "string"),
+    ]
+    column_names = [name for name, _ in core_columns]
+    rows: list[dict[str, Any]] = []
+
+    normalized_search = (search or "").strip().lower()
+    for submission in submissions:
+        payload = submission.raw_payload if isinstance(submission.raw_payload, dict) else {"value": submission.raw_payload}
+        flattened_payload = _flatten_payload_for_table(payload)
+        row = {
+            "submission_key": submission.submission_key,
+            "instrument_code": submission.instrument_code,
+            "fetched_at": submission.fetched_at.isoformat() if submission.fetched_at else None,
+            "raw_submission_id": submission.raw_submission_id,
+            "source_hash": submission.source_hash,
+        }
+        row.update(flattened_payload)
+
+        if normalized_search:
+            searchable_values = [str(value).lower() for value in row.values() if value is not None]
+            if not any(normalized_search in value for value in searchable_values):
+                continue
+
+        rows.append(row)
+        for key in flattened_payload.keys():
+            if key not in column_names:
+                column_names.append(key)
+
+    columns = [RawDataTableColumn(name=name, type="string") for name in column_names]
+    return RawDataTableResponse(
+        columns=columns,
+        rows=rows,
+        count=total_count,
+        limit=limit,
+        offset=offset,
+        has_more=offset + len(rows) < total_count,
+    )
+
+
+@app.get("/api/admin/raw-data-export")
+def export_raw_data_table(
+    search: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    submissions = (
+        db.execute(
+            select(RawSurveyCTOSubmission)
+            .order_by(RawSurveyCTOSubmission.fetched_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+
+    rows: list[dict[str, Any]] = []
+    column_names: set[str] = {"submission_key", "instrument_code", "fetched_at", "raw_submission_id", "source_hash"}
+    for submission in submissions:
+        payload = submission.raw_payload if isinstance(submission.raw_payload, dict) else {"value": submission.raw_payload}
+        flattened_payload = _flatten_payload_for_table(payload)
+        row = {
+            "submission_key": submission.submission_key,
+            "instrument_code": submission.instrument_code,
+            "fetched_at": submission.fetched_at.isoformat() if submission.fetched_at else None,
+            "raw_submission_id": submission.raw_submission_id,
+            "source_hash": submission.source_hash,
+        }
+        row.update(flattened_payload)
+        column_names.update(flattened_payload.keys())
+
+        if search:
+            normalized_search = search.strip().lower()
+            searchable_values = [str(value).lower() for value in row.values() if value is not None]
+            if not any(normalized_search in value for value in searchable_values):
+                continue
+
+        rows.append(row)
+
+    columns = sorted(column_names)
+    header = ",".join('"' + c.replace('"', '""') + '"' for c in columns)
+    body_lines = [header]
+    for row in rows:
+        values = []
+        for column in columns:
+            value = row.get(column)
+            if value is None:
+                values.append("")
+            elif isinstance(value, (dict, list)):
+                values.append(json.dumps(value, ensure_ascii=False, default=str))
+            else:
+                values.append(str(value))
+        body_lines.append(",".join('"' + value.replace('"', '""') + '"' for value in values))
+    csv_text = "\n".join(body_lines) + "\n"
+
+    return StreamingResponse(
+        iter([csv_text]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=surveycto-raw-data.csv"},
     )
 
 
