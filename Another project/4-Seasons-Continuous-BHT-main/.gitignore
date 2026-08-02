@@ -1,0 +1,11 @@
+/market_insights.duckdb
+*.duckdb
+*.duckdb.wal
+*.duckdb-wal
+*.duckdb.tmp
+*.zip
+*.env
+backend/.env
+node_modules/
+__pycache__/
+*.pyc

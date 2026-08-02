@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 220" role="img" aria-label="Noodle pack">
+  <defs>
+    <linearGradient id="pack" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ef4444"/>
+      <stop offset="100%" stop-color="#dc2626"/>
+    </linearGradient>
+    <linearGradient id="stripe" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#fde68a"/>
+    </linearGradient>
+  </defs>
+  <rect x="52" y="34" width="116" height="152" rx="14" fill="url(#pack)"/>
+  <rect x="62" y="46" width="96" height="14" rx="7" fill="#fca5a5"/>
+  <rect x="64" y="74" width="92" height="18" rx="9" fill="url(#stripe)"/>
+  <text x="110" y="88" font-size="13" text-anchor="middle" fill="#7f1d1d" font-family="Arial, sans-serif" font-weight="700">NOODLES</text>
+  <ellipse cx="110" cy="130" rx="34" ry="16" fill="#fef3c7"/>
+  <path d="M84 126h52" stroke="#f59e0b" stroke-width="4" stroke-linecap="round"/>
+  <path d="M88 132h44" stroke="#f59e0b" stroke-width="3.5" stroke-linecap="round"/>
+  <circle cx="100" cy="142" r="4" fill="#16a34a"/>
+  <circle cx="121" cy="139" r="4" fill="#f97316"/>
+</svg>

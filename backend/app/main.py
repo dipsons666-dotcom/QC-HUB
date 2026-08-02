@@ -1,23 +1,30 @@
+import csv
 import hashlib
 import json
 import logging
 import os
+import subprocess
+import sys
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 logging.basicConfig(level=logging.INFO)
 from typing import Any
 
 import requests
+import threading
+import duckdb
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .database import Base, create_schemas, get_db, get_engine
+from .database import Base, create_schemas, get_db, get_engine, get_session_local
 from .services.surveycto_credentials import (
     create_surveycto_session,
     resolve_surveycto_credentials,
@@ -54,6 +61,142 @@ from .schemas import (
     RawDataTableResponse,
 )
 
+SYNC_SCRIPT_PATH = Path(os.getenv("SYNC_SCRIPT_PATH", str(Path(__file__).resolve().parents[2] / "scripts" / "surveycto_duckdb_sync.py"))).resolve()
+SYNC_RESULT_PATH = Path(os.getenv("SYNC_RESULT_PATH", str(Path(__file__).resolve().parents[2] / "sync_result.json"))).resolve()
+EXPORT_DIR = Path(os.getenv("EXPORT_DIR", str(Path(__file__).resolve().parents[2] / "exports"))).resolve()
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
+DUCKDB_PATH = Path(os.getenv("DUCKDB_PATH", str(Path(__file__).resolve().parents[2] / "current.duckdb"))).resolve()
+DUCKDB_TEMP_DIRECTORY = Path(os.getenv("DUCKDB_TEMP_DIRECTORY", str(Path(__file__).resolve().parents[2] / "duckdb_tmp"))).resolve()
+DUCKDB_MEMORY_LIMIT = os.getenv("DUCKDB_MEMORY_LIMIT", "1536MB")
+DUCKDB_MAX_TEMP_DIRECTORY_SIZE = os.getenv("DUCKDB_MAX_TEMP_DIRECTORY_SIZE", "7GB")
+DUCKDB_THREADS = max(1, int(os.getenv("DUCKDB_THREADS", "2")))
+
+
+# Optional external XLSForm metadata (from Seasons project) used to map coded answers to labels.
+_XLSFORM_METADATA: dict[str, Any] | None = None
+_XLSFORM_ALIAS_MAP: dict[str, dict[str, Any]] | None = None
+
+
+def _load_xlsform_metadata() -> None:
+    global _XLSFORM_METADATA, _XLSFORM_ALIAS_MAP
+    if _XLSFORM_METADATA is not None:
+        return
+    # Load XLSForm metadata from this project's local backend/data folder.
+    base = Path(__file__).resolve().parents[2]
+    candidate = base / "backend" / "data" / "xlsform_metadata.json"
+    if not candidate.exists():
+        _XLSFORM_METADATA = None
+        _XLSFORM_ALIAS_MAP = None
+        return
+    try:
+        _XLSFORM_METADATA = json.loads(candidate.read_text(encoding="utf-8"))
+        if not isinstance(_XLSFORM_METADATA, dict):
+            raise ValueError("XLSForm metadata must be a JSON object")
+        # Build alias map: alias (upper/lower) -> question metadata
+        alias_map: dict[str, dict[str, Any]] = {}
+        questions: dict[str, Any] = _XLSFORM_METADATA.get("questions", {})
+        for qname, meta in questions.items():
+            for alias in meta.get("aliases", []) + [qname]:
+                alias_map[str(alias)] = meta
+        _XLSFORM_ALIAS_MAP = alias_map
+    except Exception:
+        _XLSFORM_METADATA = None
+        _XLSFORM_ALIAS_MAP = None
+
+
+def _quote_sql(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _export_raw_data_table_from_duckdb(csv_path: Path) -> bool:
+    if not DUCKDB_PATH.exists():
+        return False
+    try:
+        con = duckdb.connect(str(DUCKDB_PATH), read_only=True)
+        sql = (
+            "COPY (SELECT submission_key, instrument_code, fetched_at, source_hash, raw_payload "
+            "FROM raw_surveycto_submission ORDER BY fetched_at DESC) TO "
+            + _quote_sql(str(csv_path))
+            + " (HEADER, DELIMITER ',', QUOTE '\"')"
+        )
+        con.execute(sql)
+        con.close()
+        return True
+    except Exception:
+        return False
+
+
+def _map_cell_value(key: str, value: Any) -> Any:
+    """Map a raw cell value to a human label using XLSForm metadata when possible.
+
+    Falls back to the original value when no mapping exists.
+    """
+    _load_xlsform_metadata()
+    if not _XLSFORM_METADATA or not _XLSFORM_ALIAS_MAP:
+        return value
+
+    meta = _XLSFORM_ALIAS_MAP.get(key) or _XLSFORM_ALIAS_MAP.get(key.upper())
+    if not meta:
+        return value
+
+    list_name = meta.get("list_name")
+    if not list_name:
+        return value
+
+    lists = _XLSFORM_METADATA.get("lists", {})
+    choices = lists.get(list_name, {})
+    if not choices:
+        return value
+
+    # Handle select_multiple (could be space-separated string of choice keys)
+    kind = meta.get("kind", "")
+    try:
+        if kind == "select_multiple":
+            # normalize value to list of tokens
+            if value is None:
+                return value
+            if isinstance(value, list):
+                tokens = [str(v) for v in value]
+            else:
+                tokens = str(value).split()
+            labels = []
+            for t in tokens:
+                # keys in choices are stored as strings like '1.0' in this metadata
+                k = str(t)
+                # try k, k+'.0', float repr
+                if k in choices:
+                    labels.append(choices[k])
+                else:
+                    try:
+                        kf = float(k)
+                        kf_s = str(kf)
+                        if kf_s in choices:
+                            labels.append(choices[kf_s])
+                        else:
+                            labels.append(t)
+                    except Exception:
+                        labels.append(t)
+            return ", ".join(labels)
+
+        if kind == "select_one":
+            if value is None:
+                return value
+            k = str(value)
+            if k in choices:
+                return choices[k]
+            try:
+                kf = float(k)
+                kf_s = str(kf)
+                if kf_s in choices:
+                    return choices[kf_s]
+            except Exception:
+                pass
+            return value
+    except Exception:
+        return value
+
+
 def _get_cors_origins() -> list[str]:
     configured_origins = os.getenv("CORS_ALLOWED_ORIGINS", "")
     if configured_origins.strip():
@@ -85,6 +228,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/api/admin/xlsform-metadata")
+def get_xlsform_metadata():
+    _load_xlsform_metadata()
+    if not _XLSFORM_METADATA:
+        raise HTTPException(status_code=404, detail="XLSForm metadata not available on server")
+    # Return a minimal shape useful to the frontend: questions and lists
+    return {
+        "questions": _XLSFORM_METADATA.get("questions", {}),
+        "lists": _XLSFORM_METADATA.get("lists", {}),
+    }
+
+
 _last_surveycto_sync: dict[str, Any] = {
     "stored": 0,
     "updated": 0,
@@ -93,10 +248,243 @@ _last_surveycto_sync: dict[str, Any] = {
     "timestamp": None,
 }
 
+# Import worker thread control
+_import_worker_thread: threading.Thread | None = None
+_import_worker_stop_event: threading.Event | None = None
+
 
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/import/sync-status")
+def import_sync_status():
+    """Return last surveycto sync status recorded by the server."""
+    return _last_surveycto_sync
+
+
+@app.get("/api/import/queued")
+def list_queued_imports(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    include_payload: bool = Query(False, description="Include each queued job's raw payload in the response"),
+    db: Session = Depends(get_db),
+):
+    """Return queued ImportJob entries without loading the full payload set by default."""
+    total_count = db.execute(select(func.count()).select_from(ImportJob).where(ImportJob.status == "queued")).scalar_one()
+    jobs = (
+        db.execute(
+            select(ImportJob, RawSurveyCTOSubmission)
+            .join(
+                RawSurveyCTOSubmission,
+                RawSurveyCTOSubmission.submission_key == ImportJob.submission_key,
+                isouter=True,
+            )
+            .where(ImportJob.status == "queued")
+            .order_by(ImportJob.queued_at.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        .all()
+    )
+
+    results = []
+    for job, raw in jobs:
+        raw_payload = None
+        fetched_at = None
+        if include_payload and raw is not None:
+            raw_payload = raw.raw_payload if isinstance(raw.raw_payload, dict) else {"value": raw.raw_payload}
+            fetched_at = raw.fetched_at.isoformat() if raw.fetched_at else None
+        elif raw is not None:
+            fetched_at = raw.fetched_at.isoformat() if raw.fetched_at else None
+
+        results.append(
+            {
+                "job_id": job.job_id,
+                "submission_key": job.submission_key,
+                "instrument_code": job.instrument_code,
+                "queued_at": job.queued_at.isoformat() if job.queued_at else None,
+                "raw_payload": raw_payload,
+                "fetched_at": fetched_at,
+            }
+        )
+
+    return {"items": results, "count": total_count}
+
+
+def _import_worker_loop(stop_event: threading.Event):
+    """Background loop that processes queued imports continuously until stopped."""
+    SessionLocal = get_session_local()
+    while not stop_event.is_set():
+        db = SessionLocal()
+        try:
+            job = (
+                db.execute(
+                    select(ImportJob).where(ImportJob.status == "queued").order_by(ImportJob.queued_at.asc()).limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if job is None:
+                db.close()
+                # sleep briefly before polling again
+                stop_event.wait(2.0)
+                continue
+
+            # process job
+            processed_at = datetime.now(timezone.utc)
+            job.status = "processed"
+            job.processed_at = processed_at
+            db.commit()
+
+            # rewrite import queue JSONL if present
+            queue_path = os.getenv("IMPORT_QUEUE_PATH", "./import_queue.jsonl")
+            if os.path.exists(queue_path):
+                queue_file = Path(queue_path)
+                temp_path = queue_file.with_suffix(queue_file.suffix + ".tmp")
+                with queue_file.open("r", encoding="utf-8") as handle, temp_path.open(
+                    "w", encoding="utf-8"
+                ) as out_handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        record = json.loads(line)
+                        if record.get("submission_id") != job.submission_key:
+                            out_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                temp_path.replace(queue_file)
+
+            _append_jsonl(
+                os.getenv("PROCESSED_IMPORT_STORE_PATH", "./processed_imports.jsonl"),
+                {
+                    "submission_id": job.submission_key,
+                    "project_id": job.instrument_code,
+                    "status": "processed",
+                    "processed_at": processed_at.isoformat(),
+                },
+            )
+
+            # transform
+            raw_submission = (
+                db.execute(
+                    select(RawSurveyCTOSubmission).where(RawSurveyCTOSubmission.submission_key == job.submission_key).limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if raw_submission:
+                case_payload = raw_submission.raw_payload or {}
+                if not isinstance(case_payload, dict):
+                    case_payload = {}
+
+                answers_candidate = case_payload.get("answers")
+                answers = answers_candidate if isinstance(answers_candidate, dict) else {}
+                gps_candidate = case_payload.get("gps")
+                gps = gps_candidate if isinstance(gps_candidate, dict) else {}
+                transformed_payload = {
+                    "submission_id": job.submission_key,
+                    "project_id": job.instrument_code,
+                    "case_id": case_payload.get("case_id") or job.submission_key,
+                    "respondent_name": case_payload.get("respondent_name"),
+                    "age": answers.get("age"),
+                    "gender": answers.get("gender"),
+                    "gps_lat": gps.get("lat"),
+                    "gps_lon": gps.get("lon"),
+                    "raw_payload": case_payload,
+                }
+
+                canonical_case = MainCase(
+                    submission_key=job.submission_key,
+                    case_id=transformed_payload["case_id"],
+                    review_status="pending_review",
+                    record=transformed_payload,
+                )
+                db.add(canonical_case)
+                job.transformed_at = datetime.now(timezone.utc)
+                db.commit()
+
+                _append_jsonl(os.getenv("TRANSFORMED_CASE_STORE_PATH", "./transformed_cases.jsonl"), transformed_payload)
+
+                # evaluate rules
+                rules = db.execute(select(RuleDefinition).where(RuleDefinition.is_active.is_(True))).scalars().all()
+                for rule in rules:
+                    case_payload_local = canonical_case.record or {}
+                    if not isinstance(case_payload_local, dict):
+                        case_payload_local = {}
+                    passed, message = _evaluate_rule_against_case(case_payload_local, {
+                        "id": rule.rule_code,
+                        "name": rule.name,
+                        "field": rule.target_field,
+                        "severity": rule.severity,
+                        "operator": rule.operator,
+                        "threshold": rule.threshold,
+                    })
+                    qc_result = RuleResult(
+                        rule_code=rule.rule_code,
+                        instrument_code=rule.instrument_code,
+                        submission_key=canonical_case.submission_key,
+                        case_id=canonical_case.case_id,
+                        table_name=rule.target_table,
+                        field_name=rule.target_field,
+                        severity=rule.severity,
+                        result_status="open" if not passed else "passed",
+                        result_message=message,
+                    )
+                    db.add(qc_result)
+                    db.commit()
+
+                    if not passed:
+                        issue = IssueQueue(
+                            rule_result_id=qc_result.rule_result_id,
+                            instrument_code=rule.instrument_code,
+                            submission_key=canonical_case.submission_key,
+                            case_id=canonical_case.case_id,
+                            issue_status="pending_review",
+                            issue_summary=message,
+                            severity=rule.severity,
+                        )
+                        db.add(issue)
+                        db.commit()
+
+            db.close()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            try:
+                db.close()
+            except Exception:
+                pass
+            stop_event.wait(2.0)
+            continue
+
+
+@app.post("/api/import/start-worker")
+def start_import_worker() -> dict[str, Any]:
+    """Start a background import worker that continuously processes queued imports."""
+    global _import_worker_thread, _import_worker_stop_event
+    if _import_worker_thread and _import_worker_thread.is_alive():
+        return {"status": "running"}
+    stop_event = threading.Event()
+    thread = threading.Thread(target=_import_worker_loop, args=(stop_event,), daemon=True)
+    _import_worker_thread = thread
+    _import_worker_stop_event = stop_event
+    thread.start()
+    return {"status": "started"}
+
+
+@app.post("/api/import/stop-worker")
+def stop_import_worker() -> dict[str, Any]:
+    """Stop the background import worker if running."""
+    global _import_worker_thread, _import_worker_stop_event
+    if not _import_worker_thread or not _import_worker_thread.is_alive() or _import_worker_stop_event is None:
+        return {"status": "not_running"}
+    _import_worker_stop_event.set()
+    _import_worker_thread.join(timeout=5.0)
+    _import_worker_thread = None
+    _import_worker_stop_event = None
+    return {"status": "stopped"}
 
 
 def _append_jsonl(path_str: str, payload: dict[str, Any]) -> None:
@@ -142,7 +530,7 @@ def get_survey_platform_config(
     }
 
 
-def fetch_submission_payloads_from_form(config: dict[str, str]) -> list[dict[str, Any]]:
+def fetch_submission_payloads_from_form(config: dict[str, str], limit: int | None = None) -> list[dict[str, Any]]:
     if not config["server"] or not config["username"] or not config["password"] or not config["form_id"]:
         return []
 
@@ -177,6 +565,9 @@ def fetch_submission_payloads_from_form(config: dict[str, str]) -> list[dict[str
         if isinstance(item, dict):
             normalized_items.append(item)
 
+    if limit is not None:
+        normalized_items = normalized_items[:limit]
+
     logging.info(
         "SurveyCTO fetch: url=%s date=%s raw_items=%d normalized_items=%d",
         url,
@@ -194,7 +585,7 @@ def fetch_submission_payloads_from_form(config: dict[str, str]) -> list[dict[str
     return normalized_items
 
 
-def fetch_surveycto_dataset_records(config: dict[str, str]) -> list[dict[str, Any]]:
+def fetch_surveycto_dataset_records(config: dict[str, str], limit: int | None = None) -> list[dict[str, Any]]:
     if not config["server"] or not config["username"] or not config["password"] or not config["dataset_id"]:
         return []
 
@@ -203,7 +594,7 @@ def fetch_surveycto_dataset_records(config: dict[str, str]) -> list[dict[str, An
     next_cursor: str | None = None
 
     while True:
-        params: dict[str, Any] = {"limit": 1000}
+        params: dict[str, Any] = {"limit": min(1000, limit) if limit is not None else 1000}
         if next_cursor:
             params["cursor"] = next_cursor
 
@@ -234,8 +625,13 @@ def fetch_surveycto_dataset_records(config: dict[str, str]) -> list[dict[str, An
         normalized_page_items = [item for item in page_items if isinstance(item, dict)]
         all_items.extend(normalized_page_items)
 
+        if limit is not None and len(all_items) >= limit:
+            break
         if not next_cursor or not page_items:
             break
+
+    if limit is not None:
+        all_items = all_items[:limit]
 
     logging.info(
         "SurveyCTO dataset fetch: url=%s dataset_id=%s raw_items=%d",
@@ -253,12 +649,32 @@ def fetch_surveycto_dataset_records(config: dict[str, str]) -> list[dict[str, An
     return all_items
 
 
-def fetch_submission_payloads(config: dict[str, str] | None = None) -> list[dict[str, Any]]:
+def _fetch_submission_payloads(config: dict[str, str] | None = None, limit: int | None = None) -> list[dict[str, Any]]:
     if config is None:
         config = get_survey_platform_config()
     if config["dataset_id"]:
-        return fetch_surveycto_dataset_records(config)
-    return fetch_submission_payloads_from_form(config)
+        return fetch_surveycto_dataset_records(config, limit=limit)
+    return fetch_submission_payloads_from_form(config, limit=limit)
+
+
+def fetch_submission_payloads(config: dict[str, str] | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+    return _fetch_submission_payloads(config, limit=limit)
+
+
+def _maybe_limited_fetch_submission_payloads(
+    config: dict[str, str] | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    if limit is None:
+        return fetch_submission_payloads(config)
+
+    try:
+        return fetch_submission_payloads(config, limit=limit)
+    except TypeError:
+        try:
+            return fetch_submission_payloads(config)
+        except TypeError:
+            return fetch_submission_payloads()
 
 
 def _flatten_payload_for_table(payload: Any, prefix: str = "") -> dict[str, Any]:
@@ -288,7 +704,7 @@ def fetch_submission_payloads_status() -> tuple[list[dict[str, Any]], bool, str 
         return [], False, "Missing SurveyCTO credentials or form/dataset configuration"
 
     try:
-        items = fetch_submission_payloads(config)
+        items = _fetch_submission_payloads(config, limit=1)
         return items, True, None
     except requests.exceptions.RequestException as exc:
         logging.error("SurveyCTO connection failed: %s", exc)
@@ -413,9 +829,9 @@ def sync_survey_platform_submissions(
             request_server=payload.surveyctoServer,
             request_form_id=payload.formId,
         )
-        items = fetch_submission_payloads(config)[:batch_size]
+        items = _maybe_limited_fetch_submission_payloads(config, limit=batch_size)
     else:
-        items = fetch_submission_payloads()[:batch_size]
+        items = _maybe_limited_fetch_submission_payloads(limit=batch_size)
     fetched = len(items)
     stored = 0
     updated = 0
@@ -485,12 +901,102 @@ def sync_survey_platform_submissions(
     }
 
 
+def _run_surveycto_sync_in_thread(payload: SurveyCTOSessionRequest | None = None) -> None:
+    """Background worker to invoke the external sync process."""
+    global _last_surveycto_sync
+    _last_surveycto_sync["message"] = "Sync process starting"
+    _last_surveycto_sync["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    env = os.environ.copy()
+    env["SYNC_RESULT_PATH"] = str(SYNC_RESULT_PATH)
+    if payload is not None:
+        if payload.surveyctoServer:
+            env["SURVEYCTO_SERVER"] = payload.surveyctoServer
+        if payload.surveyctoUsername:
+            env["SURVEYCTO_USERNAME"] = payload.surveyctoUsername
+        if payload.surveyctoPassword:
+            env["SURVEYCTO_PASSWORD"] = payload.surveyctoPassword
+        if payload.formId:
+            env["SURVEYCTO_MAIN_FORM_ID"] = payload.formId
+
+    env["SYNC_RESULT_PATH"] = str(SYNC_RESULT_PATH)
+    env["DUCKDB_PATH"] = str(DUCKDB_PATH)
+    env["DUCKDB_TEMP_DIRECTORY"] = str(DUCKDB_TEMP_DIRECTORY)
+    env["DUCKDB_MEMORY_LIMIT"] = DUCKDB_MEMORY_LIMIT
+    env["DUCKDB_MAX_TEMP_DIRECTORY_SIZE"] = DUCKDB_MAX_TEMP_DIRECTORY_SIZE
+    env["DUCKDB_THREADS"] = str(DUCKDB_THREADS)
+
+    process = subprocess.run(
+        [
+            PYTHON_BIN,
+            str(SYNC_SCRIPT_PATH),
+            "--status-file",
+            str(SYNC_RESULT_PATH),
+            "--duckdb-path",
+            str(DUCKDB_PATH),
+            "--temp-directory",
+            str(DUCKDB_TEMP_DIRECTORY),
+            "--memory-limit",
+            DUCKDB_MEMORY_LIMIT,
+            "--max-temp-directory-size",
+            DUCKDB_MAX_TEMP_DIRECTORY_SIZE,
+            "--threads",
+            str(DUCKDB_THREADS),
+        ],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    try:
+        result = {}
+        if SYNC_RESULT_PATH.exists():
+            try:
+                result = json.loads(SYNC_RESULT_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                result = {}
+
+        if process.returncode != 0:
+            error_message = result.get("error") or process.stderr.strip() or process.stdout.strip() or f"Sync process failed with exit code {process.returncode}"
+            _last_surveycto_sync["message"] = f"Async sync failed: {error_message}"
+            return
+
+        if result.get("ok") is False:
+            _last_surveycto_sync["message"] = f"Async sync failed: {result.get('error', 'unknown error')}"
+            return
+
+        _last_surveycto_sync["stored"] = result.get("stored", _last_surveycto_sync["stored"])
+        _last_surveycto_sync["updated"] = result.get("updated", _last_surveycto_sync["updated"])
+        _last_surveycto_sync["skipped_submission_id"] = result.get("skipped", _last_surveycto_sync["skipped_submission_id"])
+        _last_surveycto_sync["message"] = "Async sync completed"
+        _last_surveycto_sync["timestamp"] = datetime.now(timezone.utc).isoformat()
+    except Exception as exc:
+        _last_surveycto_sync["message"] = f"Async sync failed: {exc}"
+
+
+@app.post("/api/import/survey-platform/sync-async")
+def trigger_async_survey_platform_sync(payload: SurveyCTOSessionRequest | None = None) -> dict[str, Any]:
+    """Trigger a background sync; returns immediately while the external sync process runs."""
+    thread = threading.Thread(target=_run_surveycto_sync_in_thread, args=(payload,), daemon=True)
+    thread.start()
+    return {"status": "started", "message": "Sync started in background"}
+
+
 @app.get("/api/import/survey-platform/raw", response_model=RawSurveyCTOListResponse)
-def list_raw_survey_platform_submissions(db: Session = Depends(get_db)) -> RawSurveyCTOListResponse:
+def list_raw_survey_platform_submissions(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    include_payload: bool = Query(False, description="Include the full raw payload for each submission"),
+    db: Session = Depends(get_db),
+) -> RawSurveyCTOListResponse:
+    total_count = db.execute(select(func.count()).select_from(RawSurveyCTOSubmission)).scalar_one()
     submissions = (
         db.execute(
             select(RawSurveyCTOSubmission)
             .order_by(RawSurveyCTOSubmission.fetched_at.desc())
+            .offset(offset)
+            .limit(limit)
         )
         .scalars()
         .all()
@@ -498,16 +1004,18 @@ def list_raw_survey_platform_submissions(db: Session = Depends(get_db)) -> RawSu
 
     items = [
         RawSurveyCTOItem(
-            raw_submission_id=submission.raw_submission_id,
+            raw_submission_id=str(submission.raw_submission_id),
             instrument_code=submission.instrument_code,
             submission_key=submission.submission_key,
             source_hash=submission.source_hash,
             fetched_at=submission.fetched_at,
-            raw_payload=submission.raw_payload if isinstance(submission.raw_payload, dict) else {"value": submission.raw_payload},
+            raw_payload=(submission.raw_payload if isinstance(submission.raw_payload, dict) else {"value": submission.raw_payload})
+            if include_payload
+            else {},
         )
         for submission in submissions
     ]
-    return RawSurveyCTOListResponse(items=items, count=len(items))
+    return RawSurveyCTOListResponse(items=items, count=total_count)
 
 
 @app.post("/api/import/process-next", response_model=ProcessingResponse)
@@ -532,10 +1040,16 @@ def process_next_import(db: Session = Depends(get_db)) -> ProcessingResponse:
 
     queue_path = os.getenv("IMPORT_QUEUE_PATH", "./import_queue.jsonl")
     if os.path.exists(queue_path):
-        with open(queue_path, "r", encoding="utf-8") as handle:
-            queue_records = [json.loads(line) for line in handle if line.strip()]
-        remaining = [record for record in queue_records if record.get("submission_id") != job.submission_key]
-        _rewrite_jsonl(queue_path, remaining)
+        queue_file = Path(queue_path)
+        temp_path = queue_file.with_suffix(queue_file.suffix + ".tmp")
+        with queue_file.open("r", encoding="utf-8") as handle, temp_path.open("w", encoding="utf-8") as out_handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if record.get("submission_id") != job.submission_key:
+                    out_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        temp_path.replace(queue_file)
 
     _append_jsonl(
         os.getenv("PROCESSED_IMPORT_STORE_PATH", "./processed_imports.jsonl"),
@@ -767,9 +1281,21 @@ def evaluate_next_rule(db: Session = Depends(get_db)) -> QCResultResponse:
 
 
 @app.get("/api/qc/review-queue", response_model=ReviewQueueResponse)
-def get_review_queue(db: Session = Depends(get_db)) -> ReviewQueueResponse:
+def get_review_queue(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+) -> ReviewQueueResponse:
+    total_count = db.execute(select(func.count()).select_from(IssueQueue)).scalar_one()
     issues = (
-        db.execute(select(IssueQueue).order_by(IssueQueue.created_at.asc())).scalars().all()
+        db.execute(
+            select(IssueQueue)
+            .order_by(IssueQueue.created_at.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        .scalars()
+        .all()
     )
     return ReviewQueueResponse(
         issues=[
@@ -788,7 +1314,7 @@ def get_review_queue(db: Session = Depends(get_db)) -> ReviewQueueResponse:
             )
             for issue in issues
         ],
-        count=len(issues),
+        count=total_count,
     )
 
 
@@ -837,6 +1363,7 @@ def get_admin_raw_data_table(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     search: str | None = Query(default=None),
+    interpret: bool = Query(True, description="If true, map coded answers to labels when possible"),
     db: Session = Depends(get_db),
 ) -> RawDataTableResponse:
     total_count = db.execute(select(func.count()).select_from(RawSurveyCTOSubmission)).scalar_one()
@@ -872,7 +1399,12 @@ def get_admin_raw_data_table(
             "raw_submission_id": submission.raw_submission_id,
             "source_hash": submission.source_hash,
         }
-        row.update(flattened_payload)
+        # optionally map values using XLSForm metadata
+        if interpret:
+            mapped = {k: _map_cell_value(k, v) for k, v in flattened_payload.items()}
+            row.update(mapped)
+        else:
+            row.update(flattened_payload)
 
         if normalized_search:
             searchable_values = [str(value).lower() for value in row.values() if value is not None]
@@ -898,61 +1430,91 @@ def get_admin_raw_data_table(
 @app.get("/api/admin/raw-data-export")
 def export_raw_data_table(
     search: str | None = Query(default=None),
+    interpret: bool = Query(True, description="If true, map coded answers to labels when possible"),
     db: Session = Depends(get_db),
 ):
-    submissions = (
-        db.execute(
-            select(RawSurveyCTOSubmission)
-            .order_by(RawSurveyCTOSubmission.fetched_at.desc())
-        )
-        .scalars()
-        .all()
+    query = db.execute(
+        select(RawSurveyCTOSubmission).order_by(RawSurveyCTOSubmission.fetched_at.desc())
     )
 
-    rows: list[dict[str, Any]] = []
+    jsonl_path = EXPORT_DIR / f"raw-data-{uuid4().hex}.jsonl"
+    csv_path = EXPORT_DIR / f"raw-data-{uuid4().hex}.csv"
     column_names: set[str] = {"submission_key", "instrument_code", "fetched_at", "raw_submission_id", "source_hash"}
-    for submission in submissions:
-        payload = submission.raw_payload if isinstance(submission.raw_payload, dict) else {"value": submission.raw_payload}
-        flattened_payload = _flatten_payload_for_table(payload)
-        row = {
-            "submission_key": submission.submission_key,
-            "instrument_code": submission.instrument_code,
-            "fetched_at": submission.fetched_at.isoformat() if submission.fetched_at else None,
-            "raw_submission_id": submission.raw_submission_id,
-            "source_hash": submission.source_hash,
-        }
-        row.update(flattened_payload)
-        column_names.update(flattened_payload.keys())
+    normalized_search = search.strip().lower() if search else None
 
-        if search:
-            normalized_search = search.strip().lower()
-            searchable_values = [str(value).lower() for value in row.values() if value is not None]
-            if not any(normalized_search in value for value in searchable_values):
-                continue
+    try:
+        if not interpret and normalized_search is None and _export_raw_data_table_from_duckdb(csv_path):
+            return FileResponse(
+                path=str(csv_path),
+                media_type="text/csv",
+                filename="surveycto-raw-data.csv",
+            )
 
-        rows.append(row)
+        with jsonl_path.open("w", encoding="utf-8") as jsonl_handle:
+            for submission in query.scalars():
+                payload = submission.raw_payload if isinstance(submission.raw_payload, dict) else {"value": submission.raw_payload}
+                flattened_payload = _flatten_payload_for_table(payload)
+                row = {
+                    "submission_key": submission.submission_key,
+                    "instrument_code": submission.instrument_code,
+                    "fetched_at": submission.fetched_at.isoformat() if submission.fetched_at else None,
+                    "raw_submission_id": submission.raw_submission_id,
+                    "source_hash": submission.source_hash,
+                }
+                if interpret:
+                    mapped = {k: _map_cell_value(k, v) for k, v in flattened_payload.items()}
+                    row.update(mapped)
+                else:
+                    row.update(flattened_payload)
+                column_names.update(row.keys())
 
-    columns = sorted(column_names)
-    header = ",".join('"' + c.replace('"', '""') + '"' for c in columns)
-    body_lines = [header]
-    for row in rows:
-        values = []
-        for column in columns:
-            value = row.get(column)
-            if value is None:
-                values.append("")
-            elif isinstance(value, (dict, list)):
-                values.append(json.dumps(value, ensure_ascii=False, default=str))
-            else:
-                values.append(str(value))
-        body_lines.append(",".join('"' + value.replace('"', '""') + '"' for value in values))
-    csv_text = "\n".join(body_lines) + "\n"
+                if normalized_search:
+                    searchable_values = [str(value).lower() for value in row.values() if value is not None]
+                    if not any(normalized_search in value for value in searchable_values):
+                        continue
 
-    return StreamingResponse(
-        iter([csv_text]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=surveycto-raw-data.csv"},
-    )
+                jsonl_handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        columns = sorted(column_names)
+        with csv_path.open("w", encoding="utf-8", newline="") as csv_handle:
+            writer = csv.writer(csv_handle, quoting=csv.QUOTE_ALL)
+            writer.writerow(columns)
+            with jsonl_path.open("r", encoding="utf-8") as jsonl_handle:
+                for line in jsonl_handle:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    values = []
+                    for column in columns:
+                        value = row.get(column)
+                        if value is None:
+                            values.append("")
+                        elif isinstance(value, (dict, list)):
+                            values.append(json.dumps(value, ensure_ascii=False, default=str))
+                        else:
+                            values.append(str(value))
+                    writer.writerow(values)
+
+        try:
+            jsonl_path.unlink()
+        except OSError:
+            pass
+
+        return FileResponse(
+            path=str(csv_path),
+            media_type="text/csv",
+            filename="surveycto-raw-data.csv",
+        )
+    except Exception:
+        try:
+            jsonl_path.unlink()
+        except OSError:
+            pass
+        try:
+            csv_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 @app.get("/api/admin/dashboard", response_model=AdminDashboardResponse)

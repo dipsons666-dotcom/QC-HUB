@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000';
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 
 const workflowSteps = [
   { title: 'Import', description: 'Pull SurveyCTO submissions into the QC Hub raw ingestion layer.' },
@@ -29,11 +29,17 @@ function App() {
   const [visibleColumns, setVisibleColumns] = useState([]);
   const [showColumnPicker, setShowColumnPicker] = useState(false);
   const [columnFilters, setColumnFilters] = useState({});
+  const [interpretEnabled, setInterpretEnabled] = useState(true);
+  const [xlsformMetadata, setXlsformMetadata] = useState(null);
   const [newStaff, setNewStaff] = useState({ username: '', email: '', role: 'reviewer' });
   const [adminError, setAdminError] = useState('');
+  const [queuedImports, setQueuedImports] = useState([]);
+  const [queuedCount, setQueuedCount] = useState(0);
+  const [workerStatus, setWorkerStatus] = useState('stopped');
+  const [syncDetails, setSyncDetails] = useState(null);
 
   const loadHomeData = () => {
-    fetch(`${API_BASE}/api/qc/review-queue`)
+    fetch(`${API_BASE}/api/qc/review-queue?limit=20`)
       .then((response) => response.json())
       .then((data) => {
         const loadedIssues = data.issues || [];
@@ -45,7 +51,7 @@ function App() {
         setSelectedIssue(null);
       });
 
-    fetch(`${API_BASE}/api/import/survey-platform/raw`)
+    fetch(`${API_BASE}/api/import/survey-platform/raw?limit=20&include_payload=false`)
       .then((response) => response.json())
       .then((data) => {
         const items = data.items || [];
@@ -60,7 +66,7 @@ function App() {
 
   const loadRawDataPage = (offset = 0, append = false, search = rawDataSearch, pageSize = rawDataPageSize) => {
     setRawDataLoading(true);
-    const query = new URLSearchParams({ limit: String(pageSize), offset: String(offset) });
+    const query = new URLSearchParams({ limit: String(pageSize), offset: String(offset), interpret: String(interpretEnabled) });
     if (search) query.set('search', search);
 
     fetch(`${API_BASE}/api/admin/raw-data-table?${query.toString()}`)
@@ -96,6 +102,29 @@ function App() {
       .then((data) => setStaffMembers(data || []))
       .catch(() => setStaffMembers([]));
 
+    // fetch XLSForm metadata for question labels
+    fetch(`${API_BASE}/api/admin/xlsform-metadata`)
+      .then((r) => r.json())
+      .then((m) => setXlsformMetadata(m))
+      .catch(() => setXlsformMetadata(null));
+
+    // fetch queued imports and sync status
+    fetch(`${API_BASE}/api/import/queued?limit=20&include_payload=false`)
+      .then((r) => r.json())
+      .then((d) => {
+        setQueuedImports(d.items || []);
+        setQueuedCount(d.count || 0);
+      })
+      .catch(() => {
+        setQueuedImports([]);
+        setQueuedCount(0);
+      });
+
+    fetch(`${API_BASE}/api/import/sync-status`)
+      .then((r) => r.json())
+      .then((d) => setSyncDetails(d))
+      .catch(() => setSyncDetails(null));
+
     loadRawDataPage(0, false, '', rawDataPageSize);
   };
 
@@ -118,28 +147,34 @@ function App() {
   }, [rawDataTable.columns]);
 
   const handleSync = () => {
-    setSyncStatus('Syncing...');
-    fetch(`${API_BASE}/api/import/survey-platform/sync`, { method: 'POST' })
-      .then((response) => {
-        if (!response.ok) {
-          return response.text().then((body) => {
-            throw new Error(`Sync failed (${response.status}): ${body || response.statusText}`);
-          });
-        }
-        return response.json();
-      })
-      .then((data) => {
-        const fetched = data.fetched ?? 0;
-        const stored = data.stored ?? 0;
-        const updated = data.updated ?? 0;
-        setSyncStatus(`Sync complete: fetched ${fetched}, stored ${stored}, updated ${updated}. Raw submissions: ${rawSubmissionCount}`);
+    // Trigger background sync and poll dashboard for updates so the UI doesn't block.
+    setSyncStatus('Sync started...');
+    fetch(`${API_BASE}/api/import/survey-platform/sync-async`, { method: 'POST' })
+      .then((response) => response.json())
+      .then(() => {
+        // Immediately refresh available DB data and start polling for the sync completion
         loadHomeData();
-        if (page === 'admin') {
+        if (page === 'admin') loadAdminData();
+
+        const start = Date.now();
+        const pollInterval = 3000;
+        const timeoutMs = 60000; // poll up to 60s
+
+        const id = setInterval(() => {
           loadAdminData();
-        }
+          loadHomeData();
+          // stop after timeout
+          if (Date.now() - start > timeoutMs) {
+            clearInterval(id);
+            setSyncStatus('Sync running in background; check dashboard for updates.');
+          }
+        }, pollInterval);
+
+        // stop polling when admin page updates last_sync_at or after timeout
+        setTimeout(() => clearInterval(id), timeoutMs + 2000);
       })
       .catch((error) => {
-        setSyncStatus(`Sync failed: ${error.message}`);
+        setSyncStatus(`Sync trigger failed: ${error.message}`);
       });
   };
 
@@ -216,6 +251,63 @@ function App() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+  };
+
+  const fetchQueued = () => {
+    fetch(`${API_BASE}/api/import/queued?limit=20&include_payload=false`)
+      .then((r) => r.json())
+      .then((d) => {
+        setQueuedImports(d.items || []);
+        setQueuedCount(d.count || 0);
+      })
+      .catch(() => {
+        setQueuedImports([]);
+        setQueuedCount(0);
+      });
+  };
+
+  const fetchSyncDetails = () => {
+    fetch(`${API_BASE}/api/import/sync-status`)
+      .then((r) => r.json())
+      .then((d) => setSyncDetails(d))
+      .catch(() => setSyncDetails(null));
+  };
+
+  const processNext = () => {
+    fetch(`${API_BASE}/api/import/process-next`, { method: 'POST' })
+      .then((r) => r.json())
+      .then(() => {
+        fetchQueued();
+        loadHomeData();
+        if (page === 'admin') loadAdminData();
+      })
+      .catch(() => {
+        // ignore
+      });
+  };
+
+  const startWorker = () => {
+    fetch(`${API_BASE}/api/import/start-worker`, { method: 'POST' })
+      .then((r) => r.json())
+      .then(() => {
+        setWorkerStatus('running');
+        fetchQueued();
+      })
+      .catch(() => {
+        // ignore
+      });
+  };
+
+  const stopWorker = () => {
+    fetch(`${API_BASE}/api/import/stop-worker`, { method: 'POST' })
+      .then((r) => r.json())
+      .then(() => {
+        setWorkerStatus('stopped');
+        fetchQueued();
+      })
+      .catch(() => {
+        // ignore
+      });
   };
 
   return (
@@ -311,6 +403,17 @@ function App() {
                     >
                       Columns
                     </button>
+                    <span style={{ marginLeft: 10, display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                      <label style={{ fontSize: 13, display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <input type="checkbox" checked={interpretEnabled} onChange={(e) => { setInterpretEnabled(e.target.checked); loadRawDataPage(0, false, rawDataSearch, rawDataPageSize); }} />
+                        Interpret
+                      </label>
+                      {interpretEnabled && (
+                        <div style={{ padding: '6px 8px', background: '#ecfeff', color: '#0f766e', borderRadius: 999, fontSize: 12, fontWeight: 700 }}>
+                          Interpreted
+                        </div>
+                      )}
+                    </span>
                     {showColumnPicker && (
                       <div style={{ position: 'absolute', right: 0, top: '42px', background: '#ffffff', border: '1px solid #e5e7eb', padding: 12, borderRadius: 8, boxShadow: '0 10px 30px rgba(2,6,23,0.08)', maxHeight: 320, overflow: 'auto', zIndex: 50 }}>
                         {(rawDataTable.columns || []).map((c) => (
@@ -379,6 +482,11 @@ function App() {
                             {visibleColumns.map((colName) => (
                               <td key={`${colName}-${index}`} style={{ padding: '10px 8px', borderBottom: '1px solid #f3f4f6', verticalAlign: 'top', maxWidth: 220 }}>
                                 {row[colName] == null ? '—' : typeof row[colName] === 'object' ? JSON.stringify(row[colName]) : String(row[colName]).length > 120 ? `${String(row[colName]).slice(0, 117)}…` : String(row[colName])}
+                                {interpretEnabled && (
+                                  <div style={{ marginTop: 6, fontSize: 11, color: '#065f46' }}>
+                                    <small>interpreted</small>
+                                  </div>
+                                )}
                               </td>
                             ))}
                             <td style={{ padding: '10px 8px', borderBottom: '1px solid #f3f4f6' }}>
@@ -467,6 +575,39 @@ function App() {
                         <div style={{ color: '#4b5563', fontSize: 13 }}>{member.email}</div>
                       </div>
                       <div style={{ color: '#2563eb', fontWeight: 700 }}>{member.role}</div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+              <h2 style={{ marginTop: 0 }}>New Submissions Queue</h2>
+              <div style={{ marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
+                <button onClick={processNext} style={{ padding: '8px 12px', borderRadius: 8, border: 'none', background: '#2563eb', color: '#fff', cursor: 'pointer', fontWeight: 700 }}>Process Next</button>
+                {workerStatus === 'running' ? (
+                  <button onClick={stopWorker} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #d1d5db', background: '#fff', cursor: 'pointer' }}>Stop Worker</button>
+                ) : (
+                  <button onClick={startWorker} style={{ padding: '8px 12px', borderRadius: 8, border: '1px solid #d1d5db', background: '#fff', cursor: 'pointer' }}>Start Auto-Worker</button>
+                )}
+                <div style={{ marginLeft: 'auto', color: '#6b7280' }}>Queued: {queuedCount}</div>
+              </div>
+              <div style={{ maxHeight: 260, overflow: 'auto' }}>
+                {queuedImports.length === 0 ? (
+                  <div style={{ color: '#6b7280', padding: 12, borderRadius: 8, border: '1px dashed #cbd5e1' }}>No queued submissions.</div>
+                ) : (
+                  queuedImports.map((q) => (
+                    <div key={q.job_id} style={{ borderRadius: 10, padding: 10, marginBottom: 8, background: '#f8fafc' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                        <div>
+                          <div style={{ fontWeight: 700 }}>{q.submission_key}</div>
+                          <div style={{ fontSize: 12, color: '#4b5563' }}>{q.instrument_code} • {q.fetched_at ? new Date(q.fetched_at).toLocaleString() : '—'}</div>
+                        </div>
+                        <div style={{ fontSize: 12, color: '#6b7280' }}>{q.queued_at ? new Date(q.queued_at).toLocaleString() : '—'}</div>
+                      </div>
+                      {q.raw_payload && (
+                        <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', fontSize: 12 }}>{JSON.stringify(q.raw_payload, null, 2)}</pre>
+                      )}
                     </div>
                   ))
                 )}
@@ -659,14 +800,36 @@ function App() {
                 </button>
               </div>
               <div style={{ display: 'grid', gap: 12 }}>
-                {Object.entries(selectedRawRecord).map(([key, value]) => (
-                  <div key={key} style={{ border: '1px solid #e5e7eb', borderRadius: 12, padding: 12, background: '#f8fafc' }}>
-                    <div style={{ fontWeight: 700, marginBottom: 6 }}>{key}</div>
-                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, color: '#111827' }}>
-                      {value == null ? '—' : typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}
-                    </pre>
-                  </div>
-                ))}
+                {(() => {
+                  const qmap = xlsformMetadata && xlsformMetadata.questions ? xlsformMetadata.questions : null;
+                  if (qmap) {
+                    const keys = Object.keys(qmap).filter((k) => Object.prototype.hasOwnProperty.call(selectedRawRecord, k));
+                    if (keys.length > 0) {
+                      return keys.map((key) => {
+                        const meta = qmap[key] || {};
+                        const label = meta.label || meta.prompt || meta.question || meta.text || key;
+                        const value = selectedRawRecord[key];
+                        return (
+                          <div key={key} style={{ border: '1px solid #e5e7eb', borderRadius: 12, padding: 12, background: '#f8fafc' }}>
+                            <div style={{ fontWeight: 700, marginBottom: 6 }}>{label}</div>
+                            <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, color: '#111827' }}>
+                              {value == null ? '—' : typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}
+                            </pre>
+                          </div>
+                        );
+                      });
+                    }
+                  }
+                  // fallback: show raw key/values
+                  return Object.entries(selectedRawRecord).map(([key, value]) => (
+                    <div key={key} style={{ border: '1px solid #e5e7eb', borderRadius: 12, padding: 12, background: '#f8fafc' }}>
+                      <div style={{ fontWeight: 700, marginBottom: 6 }}>{key}</div>
+                      <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, color: '#111827' }}>
+                        {value == null ? '—' : typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}
+                      </pre>
+                    </div>
+                  ));
+                })()}
               </div>
             </div>
           </div>

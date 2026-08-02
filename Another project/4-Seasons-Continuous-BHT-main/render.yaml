@@ -1,0 +1,87 @@
+envVarGroups:
+  - name: market-insights-sync-auth
+    envVars:
+      - key: SYNC_TRIGGER_TOKEN
+        generateValue: true
+
+services:
+  - type: web
+    name: market-insights-hub
+    runtime: node
+    plan: standard
+    branch: main
+    autoDeploy: true
+    buildCommand: cd frontend && npm ci --include=dev && npm run build && cd ../backend && npm ci --include=dev && npm run check && python -m pip install -r requirements.txt
+    startCommand: cd backend && bash scripts/start.sh
+    healthCheckPath: /api/health
+    disk:
+      name: market-insights-data
+      mountPath: /var/data
+      sizeGB: 10
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_ROOT
+        value: /var/data
+      - key: DUCKDB_PATH
+        value: /var/data/current.duckdb
+      - key: LONG_PARQUET_PATH
+        value: /var/data/staging/responses_long_parquet/*/*/*.parquet
+      - key: BASE_PARQUET_PATH
+        value: /var/data/staging/responses_base_parquet/*/*/*.parquet
+      - key: DUCKDB_MEMORY_LIMIT
+        value: 3GB
+      - key: DUCKDB_TEMP_DIRECTORY
+        value: /var/data/duckdb_tmp
+      - key: DUCKDB_MAX_TEMP_DIRECTORY_SIZE
+        value: 7GB
+      - key: DUCKDB_THREADS
+        value: "2"
+      - key: BHT_METADATA_PATH
+        value: /opt/render/project/src/backend/data/Meta Data Rule.xlsx
+      - key: BHT_CURRENT_METADATA_PATH
+        value: /opt/render/project/src/backend/data/Meta Data Rule.xlsx
+      - key: BHT_DATAMAP_PATH
+        value: /var/data/Datamap.xlsx
+      - key: BHT_RESPONDENT_ID_COLUMN
+        value: KEY
+      - key: SYNC_REPLACE_MONTHS
+        value: generated
+      - key: SURVEYCTO_FETCH_MODE
+        value: full
+      - key: SURVEYCTO_SCHEDULER_MODE
+        value: internal
+      - key: SYNC_INTERVAL_MS
+        value: "3600000"
+      - key: RUN_SYNC_ON_START
+        value: "false"
+      - key: DISABLE_SURVEYCTO_SYNC
+        value: "false"
+      - key: ENABLE_SURVEYCTO_SYNC
+        value: "true"
+      - key: DUCKDB_BACKUP_RETENTION
+        value: "3"
+      - key: DISABLE_MARKET_DB_FALLBACK
+        value: "true"
+      - key: MARKET_DB_PATH
+        value: /var/data/market_insights.duckdb
+      - key: SURVEYCTO_SERVER
+        sync: false
+      - key: SURVEYCTO_FORM_ID
+        sync: false
+      - key: SURVEYCTO_USERNAME
+        sync: false
+      - key: SURVEYCTO_PASSWORD
+        sync: false
+      - fromGroup: market-insights-sync-auth
+
+  - type: cron
+    name: market-insights-surveycto-sync
+    runtime: node
+    schedule: "0 * * * *"
+    buildCommand: cd backend && npm ci --omit=dev
+    startCommand: node backend/scripts/trigger-surveycto-sync.js
+    envVars:
+      - key: SYNC_TRIGGER_URL
+        sync: false
+      - fromGroup: market-insights-sync-auth

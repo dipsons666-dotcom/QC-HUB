@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -54,6 +54,22 @@ def get_db():
         db.close()
 
 
+def _ensure_issue_queue_severity_column(engine) -> None:
+    if engine.dialect.name != "postgresql":
+        return
+
+    try:
+        with engine.begin() as connection:
+            inspector = inspect(connection)
+            existing_columns = {column["name"] for column in inspector.get_columns("issue_queue", schema="qc")}
+            if "severity" not in existing_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE qc.issue_queue ADD COLUMN IF NOT EXISTS severity text NOT NULL DEFAULT 'medium'"
+                )
+    except (IntegrityError, ProgrammingError) as exc:
+        logging.warning("Unable to ensure qc.issue_queue.severity exists: %s", exc)
+
+
 def create_schemas():
     engine = get_engine()
     if engine.dialect.name != "postgresql":
@@ -73,3 +89,5 @@ def create_schemas():
         # Limited privilege users may not be allowed to create schemas,
         # and multiple workers may race to create the same schema.
         pass
+
+    _ensure_issue_queue_severity_column(engine)

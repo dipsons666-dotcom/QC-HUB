@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -55,3 +57,25 @@ def test_raw_surveycto_submissions_are_available_as_table_data(monkeypatch):
     assert body["rows"][0]["submission_key"] == "sub-002"
     assert body["rows"][0]["respondent_name"] == "Grace"
     assert body["rows"][0]["answers.age"] == 29
+
+
+def test_raw_surveycto_response_serializes_uuid_ids_as_strings(monkeypatch):
+    client = TestClient(app)
+    raw_id = uuid4()
+
+    monkeypatch.setattr(
+        "app.main.get_db",
+        lambda: iter([None]),
+    )
+
+    class FakeSession:
+        def execute(self, *args, **kwargs):
+            return type("Result", (), {"scalars": lambda self: type("Values", (), {"all": lambda self: []})()})()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("app.main.get_session_local", lambda: lambda: FakeSession())
+
+    response = client.get("/api/import/survey-platform/raw")
+    assert response.status_code == 200

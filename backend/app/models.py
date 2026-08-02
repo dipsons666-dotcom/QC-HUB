@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -43,7 +44,12 @@ def _table_args(schema_name: str, *constraints):
 
 class RawSurveyCTOSubmission(Base):
     __tablename__ = "surveycto_submission"
-    __table_args__ = _table_args("raw", UniqueConstraint("instrument_code", "submission_key", "source_hash"))
+    __table_args__ = _table_args(
+        "raw",
+        UniqueConstraint("instrument_code", "submission_key", "source_hash"),
+        Index("ix_surveycto_submission_submission_key", "submission_key"),
+        Index("ix_surveycto_submission_fetched_at", "fetched_at"),
+    )
 
     raw_submission_id: Mapped[str] = Column(String(36), primary_key=True, default=_uuid_default)
     instrument_code: Mapped[str] = Column(Text, nullable=False)
@@ -63,7 +69,7 @@ class RawSurveyCTOSubmission(Base):
 
 class ImportJob(Base):
     __tablename__ = "import_job"
-    __table_args__ = _table_args("app")
+    __table_args__ = _table_args("app", Index("ix_import_job_status_queued_at", "status", "queued_at"))
 
     job_id: Mapped[str] = Column(String(36), primary_key=True, default=_uuid_default)
     submission_key: Mapped[str] = Column(Text, nullable=False)
@@ -148,7 +154,7 @@ class RuleResult(Base):
 
 class IssueQueue(Base):
     __tablename__ = "issue_queue"
-    __table_args__ = _table_args("qc")
+    __table_args__ = _table_args("qc", Index("ix_issue_queue_created_at", "created_at"), Index("ix_issue_queue_status", "issue_status"))
 
     issue_id: Mapped[str] = Column(String(36), primary_key=True, default=_uuid_default)
     rule_result_id: Mapped[str | None] = Column(String(36))
