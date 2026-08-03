@@ -120,6 +120,64 @@ class RawDataTableResponse(BaseModel):
     has_more: bool
 
 
+class DecodedQuestionRow(BaseModel):
+    category: str
+    question: str
+    response: str
+
+
+class DecodedQuestionResponse(BaseModel):
+    submission_key: str
+    rows: list[DecodedQuestionRow]
+
+
+class InsightDistributionItem(BaseModel):
+    label: str
+    count: int
+    pct: float
+
+
+class InsightsOverviewResponse(BaseModel):
+    respondent_count: int
+    categories: list[InsightDistributionItem]
+    sectors: list[InsightDistributionItem]
+
+
+class AnalysisTableRow(BaseModel):
+    label: str
+    count: int
+    pct: float
+
+
+class AnalysisTableResponse(BaseModel):
+    id: str
+    title: str
+    question: str
+    base: int
+    rows: list[AnalysisTableRow]
+    cuts: list[dict[str, Any]]
+
+
+class AnalysisFilterField(BaseModel):
+    field: str
+    label: str
+
+
+class AnalysisQuestion(BaseModel):
+    id: str
+    label: str
+
+
+class AnalysisTablesResponse(BaseModel):
+    category: str
+    respondent_count: int
+    tables: list[AnalysisTableResponse]
+    filters: list[AnalysisFilterField]
+    filter_field: str | None = None
+    questions: list[AnalysisQuestion]
+    question_id: str | None = None
+
+
 class StaffMemberCreate(BaseModel):
     username: str
     email: str

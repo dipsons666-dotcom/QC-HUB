@@ -3,9 +3,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,8 +40,30 @@ from .models import (
     RuleResult,
     StaffMember,
 )
+from .decoded_questions import decode_submission_to_question_rows
+from .services.table_engine import (
+    available_filter_fields,
+    build_tables,
+    load_metadata,
+    load_questionnaire_xlsform,
+    load_template_registry,
+    _answers,
+    _answer_tokens,
+    _choice_label,
+    _question,
+    _options,
+)
+from .services.table_export import write_analysis_workbook
 from .schemas import (
     AdminDashboardResponse,
+    AnalysisTableResponse,
+    AnalysisTablesResponse,
+    AnalysisFilterField,
+    AnalysisQuestion,
+    DecodedQuestionResponse,
+    DecodedQuestionRow,
+    InsightDistributionItem,
+    InsightsOverviewResponse,
     IssueActionRequest,
     ProcessingResponse,
     QCResultResponse,
@@ -71,6 +95,8 @@ DUCKDB_TEMP_DIRECTORY = Path(os.getenv("DUCKDB_TEMP_DIRECTORY", str(Path(__file_
 DUCKDB_MEMORY_LIMIT = os.getenv("DUCKDB_MEMORY_LIMIT", "1536MB")
 DUCKDB_MAX_TEMP_DIRECTORY_SIZE = os.getenv("DUCKDB_MAX_TEMP_DIRECTORY_SIZE", "7GB")
 DUCKDB_THREADS = max(1, int(os.getenv("DUCKDB_THREADS", "2")))
+QUESTIONNAIRE_WORKBOOK_PATH = Path(os.getenv("QUESTIONNAIRE_WORKBOOK_PATH", str(Path(__file__).resolve().parents[1] / "BHT+4+SEASONS+JULY+2026.xlsx"))).resolve()
+ANALYSIS_TEMPLATE_PATH = Path(os.getenv("ANALYSIS_TEMPLATE_PATH", str(Path(__file__).resolve().parents[1] / "BHT_FULL_DATA_TABLES_MAY_2026_NOODLES_FIXED.xlsx"))).resolve()
 
 
 # Optional external XLSForm metadata (from Seasons project) used to map coded answers to labels.
@@ -770,6 +796,7 @@ def import_surveycto(payload: SurveyCTOImportRequest, db: Session = Depends(get_
     db.add(raw_submission)
     db.add(import_job)
     db.commit()
+    _refresh_analysis_workbook(db)
     db.refresh(raw_submission)
     db.refresh(import_job)
 
@@ -884,6 +911,8 @@ def sync_survey_platform_submissions(
             updated += 1
 
     db.commit()
+    if stored or updated:
+        _refresh_analysis_workbook(db)
 
     _last_surveycto_sync["stored"] = stored
     _last_surveycto_sync["updated"] = updated
@@ -898,6 +927,7 @@ def sync_survey_platform_submissions(
         "stored": stored,
         "updated": updated,
         "skipped_submission_id": skipped_submission_id,
+        "analysis_refreshed": bool(stored or updated),
     }
 
 
@@ -966,13 +996,65 @@ def _run_surveycto_sync_in_thread(payload: SurveyCTOSessionRequest | None = None
             _last_surveycto_sync["message"] = f"Async sync failed: {result.get('error', 'unknown error')}"
             return
 
-        _last_surveycto_sync["stored"] = result.get("stored", _last_surveycto_sync["stored"])
-        _last_surveycto_sync["updated"] = result.get("updated", _last_surveycto_sync["updated"])
+        # The external worker deliberately writes a durable raw DuckDB snapshot.
+        # Mirror that snapshot into the application's raw-response table before
+        # declaring the sync complete; the analysis API and workbook both read
+        # from this table, so this makes async syncs reportable automatically.
+        mirrored_stored, mirrored_updated = _mirror_duckdb_raw_submissions()
+        _last_surveycto_sync["stored"] = mirrored_stored
+        _last_surveycto_sync["updated"] = mirrored_updated
         _last_surveycto_sync["skipped_submission_id"] = result.get("skipped", _last_surveycto_sync["skipped_submission_id"])
         _last_surveycto_sync["message"] = "Async sync completed"
         _last_surveycto_sync["timestamp"] = datetime.now(timezone.utc).isoformat()
     except Exception as exc:
         _last_surveycto_sync["message"] = f"Async sync failed: {exc}"
+
+
+def _mirror_duckdb_raw_submissions() -> tuple[int, int]:
+    """Copy the completed SurveyCTO DuckDB snapshot into the reporting store."""
+    if not DUCKDB_PATH.exists():
+        return 0, 0
+    connection = duckdb.connect(str(DUCKDB_PATH), read_only=True)
+    try:
+        rows = connection.execute(
+            "SELECT submission_key, instrument_code, source_hash, raw_payload FROM raw_surveycto_submission"
+        ).fetchall()
+    finally:
+        connection.close()
+    session = get_session_local()()
+    stored = updated = 0
+    try:
+        for submission_key, instrument_code, source_hash, raw_payload in rows:
+            try:
+                answers = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+            except json.JSONDecodeError:
+                answers = {"value": raw_payload}
+            existing = session.execute(
+                select(RawSurveyCTOSubmission).where(
+                    RawSurveyCTOSubmission.instrument_code == str(instrument_code),
+                    RawSurveyCTOSubmission.submission_key == str(submission_key),
+                )
+            ).scalars().first()
+            if existing:
+                if existing.source_hash != str(source_hash):
+                    existing.source_hash = str(source_hash)
+                    existing.raw_payload = answers
+                    existing.fetched_at = datetime.now(timezone.utc)
+                    updated += 1
+                continue
+            session.add(RawSurveyCTOSubmission(
+                instrument_code=str(instrument_code), form_id=None, formdef_version=None,
+                survey_month=None, submission_key=str(submission_key), submission_version=1,
+                submission_date=None, completion_date=None, interviewer_username=None,
+                device_id=None, source_hash=str(source_hash), raw_payload=answers,
+            ))
+            stored += 1
+        session.commit()
+        if stored or updated:
+            _refresh_analysis_workbook(session)
+        return stored, updated
+    finally:
+        session.close()
 
 
 @app.post("/api/import/survey-platform/sync-async")
@@ -1425,6 +1507,189 @@ def get_admin_raw_data_table(
         offset=offset,
         has_more=offset + len(rows) < total_count,
     )
+
+
+@app.get("/api/admin/decoded-questions/{submission_key}", response_model=DecodedQuestionResponse)
+def get_decoded_questions(submission_key: str, db: Session = Depends(get_db)) -> DecodedQuestionResponse:
+    submission = (
+        db.execute(select(RawSurveyCTOSubmission).where(RawSurveyCTOSubmission.submission_key == submission_key).limit(1))
+        .scalars()
+        .first()
+    )
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    payload = submission.raw_payload if isinstance(submission.raw_payload, dict) else {"value": submission.raw_payload}
+    answers_payload = payload.get("answers") or payload
+    question_rows = decode_submission_to_question_rows(
+        answers_payload,
+        metadata_path=Path(__file__).resolve().parents[1] / "data" / "xlsform_metadata.json",
+        limit=250,
+    )
+    return DecodedQuestionResponse(
+        submission_key=submission.submission_key,
+        rows=[DecodedQuestionRow(category=row["category"], question=row["question"], response=row["response"]) for row in question_rows],
+    )
+
+
+@app.get("/api/insights/overview", response_model=InsightsOverviewResponse)
+def get_insights_overview(db: Session = Depends(get_db)) -> InsightsOverviewResponse:
+    """Return presentation-ready distributions instead of exposing submission payloads."""
+    metadata_path = Path(__file__).resolve().parents[1] / "data" / "xlsform_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+    choice_lists = metadata.get("lists", {}) if isinstance(metadata, dict) else {}
+    questions = metadata.get("questions", {}) if isinstance(metadata, dict) else {}
+
+    def answer_label(question_name: str, value: Any) -> str:
+        question = questions.get(question_name, {}) if isinstance(questions, dict) else {}
+        question_type = str(question.get("type", "")) if isinstance(question, dict) else ""
+        list_name = question_type.replace("select_one", "", 1).replace("select_multiple", "", 1).strip()
+        options = choice_lists.get(list_name, {}) if isinstance(choice_lists, dict) else {}
+        raw = str(value).strip()
+        return str(options.get(raw) or options.get(f"{raw}.0") or raw)
+
+    sector_counts: Counter[str] = Counter()
+    category_counts: Counter[str] = Counter()
+    submissions = db.execute(select(RawSurveyCTOSubmission.raw_payload)).scalars().all()
+    for payload in submissions:
+        answers = payload.get("answers", payload) if isinstance(payload, dict) else {}
+        if not isinstance(answers, dict):
+            continue
+        if answers.get("Sector") not in (None, ""):
+            sector_counts[answer_label("Sector", answers["Sector"])] += 1
+        # N_QC1 is the questionnaire's "ever consumed" category-selection block.
+        for key, value in answers.items():
+            if not re.fullmatch(r"N_QC1\.\d+", str(key)) or value in (None, ""):
+                continue
+            values = value if isinstance(value, list) else str(value).split()
+            for selected_value in values:
+                label = answer_label(str(key), selected_value)
+                if label and label.lower() not in {"none", "none of these", "not applicable"}:
+                    category_counts[label] += 1
+
+    respondent_count = len(submissions)
+    def make_items(counts: Counter[str]) -> list[InsightDistributionItem]:
+        return [
+            InsightDistributionItem(label=label, count=count, pct=round((count / respondent_count) * 100, 1) if respondent_count else 0)
+            for label, count in counts.most_common(12)
+        ]
+
+    return InsightsOverviewResponse(
+        respondent_count=respondent_count,
+        categories=make_items(category_counts),
+        sectors=make_items(sector_counts),
+    )
+
+
+def _analysis_tables_for_category(
+    db: Session,
+    category: str,
+    filter_field: str | None = None,
+    question_id: str | None = None,
+    response_filter_question: str | None = None,
+    response_filter_value: str | None = None,
+) -> tuple[int, list[dict[str, Any]], list[dict[str, str]], str | None, list[dict[str, str]], str | None]:
+    metadata_path = Path(__file__).resolve().parents[1] / "data" / "xlsform_metadata.json"
+    if QUESTIONNAIRE_WORKBOOK_PATH.exists():
+        metadata = load_questionnaire_xlsform(QUESTIONNAIRE_WORKBOOK_PATH)
+    elif metadata_path.exists():
+        metadata = load_metadata(metadata_path)
+    else:
+        raise HTTPException(status_code=503, detail="Questionnaire decoding source is not available")
+    payloads = db.execute(select(RawSurveyCTOSubmission.raw_payload)).scalars().all()
+    # Optionally filter payloads to those where a given question contains a specific response label
+    if response_filter_question and response_filter_value:
+        filtered = []
+        for payload in payloads:
+            answers = _answers(payload)
+            # resolve key case-insensitively
+            match_key = next((k for k in answers.keys() if k.lower() == response_filter_question.lower()), None)
+            if not match_key:
+                continue
+            qmeta = _question(metadata, match_key)
+            qtype = str(qmeta.get("type", "")) if qmeta else ""
+            tokens = _answer_tokens(answers.get(match_key), qtype)
+            options = _options(metadata, match_key)
+            labels = [_choice_label(options, t) for t in tokens]
+            if any(str(l) == str(response_filter_value) for l in labels):
+                filtered.append(payload)
+        payloads = filtered
+    filters = available_filter_fields(payloads, metadata)
+    available_fields = {item["field"].lower(): item["field"] for item in filters}
+    selected_filter = available_fields.get((filter_field or "").lower())
+    if selected_filter is None:
+        selected_filter = next((item["field"] for item in filters if item["field"].lower() == "gender"), None)
+    if selected_filter is None and filters:
+        selected_filter = filters[0]["field"]
+    registry = load_template_registry(ANALYSIS_TEMPLATE_PATH, metadata, category) if ANALYSIS_TEMPLATE_PATH.exists() else None
+    registry = registry or []
+    questions = [{"id": name, "label": str(metadata.get("questions", {}).get(name, {}).get("label") or title)} for name, title in registry]
+    selected_question = next((item["id"] for item in questions if item["id"].lower() == (question_id or "").lower()), None)
+    if selected_question is None and questions:
+        selected_question = questions[0]["id"]
+    selected_registry = [item for item in registry if item[0] == selected_question] if selected_question else registry
+    tables = build_tables(
+        payloads, metadata, category=category, registry=selected_registry,
+        cut_fields=[selected_filter] if selected_filter else [],
+    )
+    if not tables:
+        raise HTTPException(status_code=404, detail=f"No table registry is configured for category '{category}'")
+    return len(payloads), tables, filters, selected_filter, questions, selected_question
+
+
+def _refresh_analysis_workbook(db: Session, category: str = "noodles") -> None:
+    """Regenerate the latest analysis output after new SurveyCTO data is saved."""
+    try:
+        _, tables, _, _, _, _ = _analysis_tables_for_category(db, category)
+        write_analysis_workbook(
+            EXPORT_DIR / f"bht-{category.lower()}-analysis.xlsx",
+            category,
+            tables,
+            template_path=ANALYSIS_TEMPLATE_PATH,
+        )
+    except Exception as exc:
+        # A reporting failure must not roll back a successful SurveyCTO import.
+        logging.exception("Analysis workbook refresh failed: %s", exc)
+
+
+@app.get("/api/analytics/tables", response_model=AnalysisTablesResponse)
+def get_analysis_tables(
+    category: str = Query("noodles"),
+    filter_field: str | None = Query(default=None),
+    question_id: str | None = Query(default=None),
+    filter_question: str | None = Query(default=None),
+    filter_value: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> AnalysisTablesResponse:
+    """Serve the same analysis model used to create the downloadable workbook."""
+    respondent_count, tables, filters, selected_filter, questions, selected_question = _analysis_tables_for_category(
+        db, category, filter_field, question_id, response_filter_question=filter_question, response_filter_value=filter_value
+    )
+    # Convert raw dicts into typed response models to satisfy static type checkers
+    filters_models = [AnalysisFilterField(field=item["field"], label=item["label"]) for item in filters]
+    questions_models = [AnalysisQuestion(id=item["id"], label=item["label"]) for item in questions]
+    return AnalysisTablesResponse(
+        category=category.title(),
+        respondent_count=respondent_count,
+        tables=[AnalysisTableResponse.model_validate(table) for table in tables],
+        filters=filters_models,
+        filter_field=selected_filter,
+        questions=questions_models,
+        question_id=selected_question,
+    )
+
+
+@app.get("/api/analytics/tables/export")
+def export_analysis_tables(category: str = Query("noodles"), db: Session = Depends(get_db)) -> FileResponse:
+    respondent_count, tables, _, _, _, _ = _analysis_tables_for_category(db, category)
+    _ = respondent_count
+    filename = f"bht-{category.lower()}-analysis.xlsx"
+    export_path = EXPORT_DIR / filename
+    try:
+        write_analysis_workbook(export_path, category, tables, template_path=ANALYSIS_TEMPLATE_PATH)
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="Excel export support is not installed") from exc
+    return FileResponse(export_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=filename)
 
 
 @app.get("/api/admin/raw-data-export")

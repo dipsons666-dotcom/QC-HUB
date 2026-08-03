@@ -14,7 +14,7 @@ function App() {
   const [selectedIssue, setSelectedIssue] = useState(null);
   const [rawImports, setRawImports] = useState([]);
   const [rawSubmissionCount, setRawSubmissionCount] = useState(0);
-  const [page, setPage] = useState('home');
+  const [page, setPage] = useState('insights');
   const [syncStatus, setSyncStatus] = useState('');
   const [dashboard, setDashboard] = useState(null);
   const [staffMembers, setStaffMembers] = useState([]);
@@ -37,6 +37,16 @@ function App() {
   const [queuedCount, setQueuedCount] = useState(0);
   const [workerStatus, setWorkerStatus] = useState('stopped');
   const [syncDetails, setSyncDetails] = useState(null);
+  const [decodedQuestions, setDecodedQuestions] = useState([]);
+  const [decodedSubmissionKey, setDecodedSubmissionKey] = useState('');
+  const [decodedLoading, setDecodedLoading] = useState(false);
+  const [decodedAutoLoadAttempted, setDecodedAutoLoadAttempted] = useState(false);
+  const [expandedDecodedCategories, setExpandedDecodedCategories] = useState({});
+  const [insights, setInsights] = useState({ respondent_count: 0, categories: [], sectors: [] });
+  const [insightsLoading, setInsightsLoading] = useState(false);
+  const [analysisTables, setAnalysisTables] = useState({ respondent_count: 0, tables: [], filters: [], filter_field: null, questions: [], question_id: null });
+  const [selectedAnalysisTableId, setSelectedAnalysisTableId] = useState('');
+  const [selectedAnalysisCut, setSelectedAnalysisCut] = useState('Total');
 
   const loadHomeData = () => {
     fetch(`${API_BASE}/api/qc/review-queue?limit=20`)
@@ -139,6 +149,16 @@ function App() {
   }, [page]);
 
   useEffect(() => {
+    if (page === 'decoded') {
+      loadLatestDecodedQuestions();
+    }
+  }, [page]);
+
+  useEffect(() => {
+    if (page === 'insights') loadInsights();
+  }, [page]);
+
+  useEffect(() => {
     // initialize visible columns whenever the table metadata changes
     const cols = rawDataTable.columns || [];
     if (cols.length > 0 && visibleColumns.length === 0) {
@@ -150,7 +170,18 @@ function App() {
     // Trigger background sync and poll dashboard for updates so the UI doesn't block.
     setSyncStatus('Sync started...');
     fetch(`${API_BASE}/api/import/survey-platform/sync-async`, { method: 'POST' })
-      .then((response) => response.json())
+      .then(async (response) => {
+        const body = await response.text();
+        if (!response.ok) {
+          let result = {};
+          try {
+            result = body ? JSON.parse(body) : {};
+          } catch { /* Use the HTTP status when the error body is not JSON. */ }
+          throw new Error(result.detail || result.message || `Sync request failed (HTTP ${response.status})`);
+        }
+
+        return body;
+      })
       .then(() => {
         // Immediately refresh available DB data and start polling for the sync completion
         loadHomeData();
@@ -273,6 +304,135 @@ function App() {
       .catch(() => setSyncDetails(null));
   };
 
+  const loadDecodedQuestions = (submissionKey) => {
+    if (!submissionKey) return;
+    setDecodedLoading(true);
+    fetch(`${API_BASE}/api/admin/decoded-questions/${encodeURIComponent(submissionKey)}`)
+      .then((r) => r.json())
+      .then((data) => {
+        const rows = data.rows || [];
+        setDecodedQuestions(rows);
+        setDecodedSubmissionKey(submissionKey);
+        setExpandedDecodedCategories((current) => {
+          if (Object.keys(current).length > 0) return current;
+          const firstCategory = rows[0]?.category || 'General';
+          return { [firstCategory]: true };
+        });
+      })
+      .catch(() => {
+        setDecodedQuestions([]);
+        setDecodedSubmissionKey(submissionKey);
+      })
+      .finally(() => setDecodedLoading(false));
+  };
+
+  const loadLatestDecodedQuestions = () => {
+    if (decodedAutoLoadAttempted) return;
+    setDecodedAutoLoadAttempted(true);
+    fetch(`${API_BASE}/api/admin/raw-data-table?limit=1&offset=0&interpret=false`)
+      .then((response) => response.json())
+      .then((data) => {
+        const firstRow = (data.rows || [])[0];
+        const fallbackKey = firstRow?.submission_key || '';
+        if (fallbackKey) {
+          loadDecodedQuestions(fallbackKey);
+        }
+      })
+      .catch(() => {
+        setDecodedQuestions([]);
+      });
+  };
+
+  const [appliedResponseFilter, setAppliedResponseFilter] = useState(null);
+
+  const loadInsights = (filterField = '', questionId = '', responseQuestion = '', responseValue = '') => {
+    setInsightsLoading(true);
+    const analysisQuery = new URLSearchParams({ category: 'noodles' });
+    if (filterField) analysisQuery.set('filter_field', filterField);
+    if (questionId) analysisQuery.set('question_id', questionId);
+    if (responseQuestion) analysisQuery.set('filter_question', responseQuestion);
+    if (responseValue) analysisQuery.set('filter_value', responseValue);
+    Promise.all([
+      fetch(`${API_BASE}/api/insights/overview`).then((response) => response.ok ? response.json() : Promise.reject()),
+      fetch(`${API_BASE}/api/analytics/tables?${analysisQuery.toString()}`).then((response) => response.ok ? response.json() : Promise.reject()),
+    ])
+      .then(([overview, tableData]) => {
+        setInsights(overview);
+        setAnalysisTables(tableData);
+        setSelectedAnalysisTableId(tableData.question_id || tableData.tables?.[0]?.id || '');
+        setSelectedAnalysisCut(tableData.filter_field || 'Total');
+        if (responseQuestion && responseValue) setAppliedResponseFilter({ question: responseQuestion, value: responseValue });
+        else setAppliedResponseFilter(null);
+      })
+      .catch(() => {
+        setInsights({ respondent_count: 0, categories: [], sectors: [] });
+        setAnalysisTables({ respondent_count: 0, tables: [], filters: [], filter_field: null, questions: [], question_id: null });
+        setAppliedResponseFilter(null);
+      })
+      .finally(() => setInsightsLoading(false));
+  };
+
+  const decodedQuestionGroups = useMemo(() => {
+    return decodedQuestions.reduce((groups, row) => {
+      const category = row.category || 'General';
+      if (!groups[category]) groups[category] = [];
+      groups[category].push(row);
+      return groups;
+    }, {});
+  }, [decodedQuestions]);
+
+  const toggleDecodedCategory = (category) => {
+    setExpandedDecodedCategories((current) => ({
+      ...current,
+      [category]: !current[category],
+    }));
+  };
+
+  const DistributionCard = ({ title, items, emptyMessage }) => {
+    const topCount = Math.max(...items.map((item) => item.count), 1);
+    const colors = ['#1aa7e0', '#10b981', '#f59e0b', '#8b5cf6', '#f43f5e', '#3b82f6', '#14b8a6'];
+    return (
+      <section style={{ background: '#ffffff', borderRadius: 22, padding: 22, boxShadow: '0 12px 30px rgba(15, 23, 42, 0.06)', minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+          <h2 style={{ margin: 0, color: '#0875b8', fontSize: 13, letterSpacing: '0.14em', textTransform: 'uppercase' }}>{title}</h2>
+          <span style={{ width: 32, height: 32, borderRadius: '50%', display: 'grid', placeItems: 'center', background: '#216ee8', color: '#ffffff', fontSize: 16 }}>▥</span>
+        </div>
+        {items.length === 0 ? (
+          <div style={{ padding: '28px 10px', color: '#64748b', textAlign: 'center', border: '1px dashed #cbd5e1', borderRadius: 12 }}>{emptyMessage}</div>
+        ) : (
+          <div style={{ display: 'grid', gap: 10, maxHeight: 520, overflowY: 'auto', paddingRight: 3 }}>
+            {items.map((item, index) => (
+              <div key={item.label} style={{ padding: '11px 10px', borderRadius: 12, background: '#fbfdff' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14, fontSize: 13, color: '#17233a', marginBottom: 8 }}>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.label}</span>
+                  <strong style={{ whiteSpace: 'nowrap' }}>{item.count.toLocaleString()} ({item.pct}%)</strong>
+                </div>
+                <div style={{ height: 7, borderRadius: 999, background: '#e8edf3', overflow: 'hidden' }}>
+                  <div style={{ width: `${(item.count / topCount) * 100}%`, height: '100%', background: colors[index % colors.length], borderRadius: 999 }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    );
+  };
+
+  const selectedAnalysisTable = useMemo(
+    () => analysisTables.tables.find((table) => table.id === selectedAnalysisTableId) || analysisTables.tables[0],
+    [analysisTables.tables, selectedAnalysisTableId],
+  );
+
+  const selectedAnalysisGroups = useMemo(() => {
+    if (!selectedAnalysisTable || selectedAnalysisCut === 'Total') return [];
+    return selectedAnalysisTable.cuts?.find((cut) => cut.field === selectedAnalysisCut)?.groups || [];
+  }, [selectedAnalysisTable, selectedAnalysisCut]);
+
+  const selectedAnalysisCutDetails = useMemo(
+    () => selectedAnalysisTable?.cuts?.find((cut) => cut.field === selectedAnalysisCut),
+    [selectedAnalysisTable, selectedAnalysisCut],
+  );
+
   const processNext = () => {
     fetch(`${API_BASE}/api/import/process-next`, { method: 'POST' })
       .then((r) => r.json())
@@ -316,6 +476,20 @@ function App() {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
           <div>
             <button
+              onClick={() => setPage('insights')}
+              style={{
+                padding: '12px 18px',
+                marginRight: 10,
+                borderRadius: 12,
+                border: page === 'insights' ? '2px solid #2563eb' : '1px solid #d1d5db',
+                background: page === 'insights' ? '#eff6ff' : '#ffffff',
+                cursor: 'pointer',
+                fontWeight: 700,
+              }}
+            >
+              Insights
+            </button>
+            <button
               onClick={() => setPage('home')}
               style={{
                 padding: '12px 18px',
@@ -342,6 +516,19 @@ function App() {
             >
               Admin Portal
             </button>
+            <button
+              onClick={() => setPage('decoded')}
+              style={{
+                padding: '12px 18px',
+                borderRadius: 12,
+                border: page === 'decoded' ? '2px solid #2563eb' : '1px solid #d1d5db',
+                background: page === 'decoded' ? '#eff6ff' : '#ffffff',
+                cursor: 'pointer',
+                fontWeight: 700,
+              }}
+            >
+              Decoded Questions
+            </button>
           </div>
           <div style={{ display: 'grid', gap: 8 }}>
             <button
@@ -358,7 +545,138 @@ function App() {
           </div>
         </div>
 
-        {page === 'admin' ? (
+        {page === 'insights' ? (
+          <section style={{ display: 'grid', gap: 16, marginBottom: 24 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', gap: 16, flexWrap: 'wrap' }}>
+              <div>
+                <div style={{ color: '#0875b8', fontWeight: 800, fontSize: 13, letterSpacing: '0.14em', textTransform: 'uppercase' }}>Survey interpretation</div>
+                <h1 style={{ margin: '6px 0 0', fontSize: 30 }}>Question analysis</h1>
+                <p style={{ margin: '6px 0 0', color: '#64748b' }}>Choose a question, then compare its answer options by any available filter.</p>
+              </div>
+              <button onClick={() => loadInsights(selectedAnalysisCut === 'Total' ? '' : selectedAnalysisCut, selectedAnalysisTableId)} style={{ padding: '10px 14px', borderRadius: 10, border: 'none', background: '#216ee8', color: '#ffffff', cursor: 'pointer', fontWeight: 700 }}>
+                {insightsLoading ? 'Refreshing…' : 'Refresh insights'}
+              </button>
+            </div>
+            <section style={{ display: 'grid', gridTemplateColumns: '280px minmax(0, 1fr)', background: '#ffffff', borderRadius: 22, overflow: 'hidden', boxShadow: '0 12px 30px rgba(15, 23, 42, 0.06)' }}>
+              <aside style={{ padding: 18, background: '#f8fafc', borderRight: '1px solid #e2e8f0', maxHeight: '72vh', overflowY: 'auto' }}>
+                <div style={{ color: '#0875b8', fontSize: 12, fontWeight: 800, letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 10 }}>Questions</div>
+                <select value={selectedAnalysisTableId} onChange={(event) => loadInsights(selectedAnalysisCut === 'Total' ? '' : selectedAnalysisCut, event.target.value)} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #cbd5e1', background: '#fff', marginBottom: 12 }}>
+                  {(analysisTables.questions || []).map((question) => <option key={question.id} value={question.id}>{question.label}</option>)}
+                </select>
+                <div style={{ display: 'grid', gap: 6 }}>{(analysisTables.questions || []).map((question) => <button key={question.id} onClick={() => loadInsights(selectedAnalysisCut === 'Total' ? '' : selectedAnalysisCut, question.id)} style={{ padding: '9px 10px', border: 'none', borderRadius: 8, textAlign: 'left', cursor: 'pointer', background: question.id === selectedAnalysisTableId ? '#dbeafe' : 'transparent', color: '#1e3a5f', fontSize: 12, fontWeight: question.id === selectedAnalysisTableId ? 700 : 500 }}>{question.label}</button>)}</div>
+                <div style={{ marginTop: 14 }}>
+                  <div style={{ color: '#64748b', fontSize: 12, fontWeight: 800, marginBottom: 8 }}>Options</div>
+                  {selectedAnalysisTable ? (
+                    <div style={{ display: 'grid', gap: 8 }}>
+                      {selectedAnalysisTable.rows.map((row) => (
+                        <button
+                          key={row.label}
+                          onClick={() => loadInsights(selectedAnalysisCut === 'Total' ? '' : selectedAnalysisCut, selectedAnalysisTableId, selectedAnalysisTableId, row.label)}
+                          style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 10px', borderRadius: 8, border: '1px solid #e6eef8', background: appliedResponseFilter && appliedResponseFilter.question === selectedAnalysisTableId && appliedResponseFilter.value === row.label ? '#dbeafe' : '#fff', cursor: 'pointer', fontSize: 13 }}
+                        >
+                          <span style={{ textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.label}</span>
+                          <span style={{ color: '#64748b', marginLeft: 8 }}>{row.count}</span>
+                        </button>
+                      ))}
+                      {appliedResponseFilter && appliedResponseFilter.question === selectedAnalysisTableId && (
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+                          <div style={{ fontSize: 12, color: '#374151' }}>Filter applied: <strong>{appliedResponseFilter.value}</strong></div>
+                          <button onClick={() => loadInsights(selectedAnalysisCut === 'Total' ? '' : selectedAnalysisCut, selectedAnalysisTableId)} style={{ padding: '6px 8px', borderRadius: 8, border: '1px solid #d1d5db', background: '#fff', cursor: 'pointer' }}>Clear</button>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ color: '#9ca3af', fontSize: 13 }}>Select a question to view its options.</div>
+                  )}
+                </div>
+              </aside>
+              <div style={{ padding: 22, minWidth: 0 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
+                <div>
+                  <div style={{ color: '#0875b8', fontWeight: 800, fontSize: 13, letterSpacing: '0.14em', textTransform: 'uppercase' }}>Noodles tracker</div>
+                  <h2 style={{ margin: '5px 0 0', fontSize: 20 }}>{selectedAnalysisTable?.title || 'Generated analysis tables'}</h2>
+                  {selectedAnalysisTable && <div style={{ marginTop: 4, color: '#64748b', fontSize: 13 }}>Base: {selectedAnalysisTable.base.toLocaleString()} · {selectedAnalysisTable.question}</div>}
+                </div>
+                <a href={`${API_BASE}/api/analytics/tables/export?category=noodles`} style={{ padding: '10px 14px', borderRadius: 10, background: '#eff6ff', color: '#155dc4', fontWeight: 700, textDecoration: 'none' }}>Download Excel</a>
+              </div>
+              {analysisTables.tables.length > 0 ? (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0 14px', flexWrap: 'wrap' }}>
+                    <label htmlFor="analysis-cut" style={{ color: '#52667d', fontSize: 13, fontWeight: 700 }}>Filter / break down by</label>
+                    <select id="analysis-cut" value={selectedAnalysisCut} onChange={(event) => { const field = event.target.value; if (field === 'Total') setSelectedAnalysisCut('Total'); else loadInsights(field, selectedAnalysisTableId); }} style={{ padding: '8px 10px', border: '1px solid #cbd5e1', borderRadius: 8, background: '#fff', color: '#1e3a5f' }}>
+                      <option value="Total">Total sample</option>
+                      {(analysisTables.filters || []).map((filter) => <option key={filter.field} value={filter.field}>{filter.label}</option>)}
+                    </select>
+                    {selectedAnalysisCut !== 'Total' && <span style={{ color: '#64748b', fontSize: 12 }}>Each column shows N and % within that demographic group.</span>}
+                    {selectedAnalysisCutDetails?.truncated && <span style={{ color: '#9a3412', fontSize: 12 }}>Showing the {selectedAnalysisGroups.length} largest values out of {selectedAnalysisCutDetails.total_groups}.</span>}
+                  </div>
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                      <thead><tr style={{ background: '#f8fafc', color: '#475569', textAlign: 'left' }}><th style={{ padding: 10 }}>Response</th>{selectedAnalysisCut === 'Total' ? <><th style={{ padding: 10, textAlign: 'right' }}>N</th><th style={{ padding: 10, textAlign: 'right' }}>%</th></> : selectedAnalysisGroups.map((group) => <th key={group.label} style={{ padding: 10, textAlign: 'right', whiteSpace: 'nowrap' }}>{group.label}<small style={{ display: 'block', color: '#64748b' }}>Base {group.base}</small></th>)}</tr></thead>
+                      <tbody>{selectedAnalysisTable?.rows.map((row) => <tr key={row.label} style={{ borderTop: '1px solid #edf2f7' }}><td style={{ padding: 10 }}>{row.label}</td>{selectedAnalysisCut === 'Total' ? <><td style={{ padding: 10, textAlign: 'right', fontWeight: 700 }}>{row.count.toLocaleString()}</td><td style={{ padding: 10, textAlign: 'right' }}>{row.pct}%</td></> : selectedAnalysisGroups.map((group) => { const count = group.counts?.[row.label] || 0; const pct = group.base ? Math.round((count / group.base) * 1000) / 10 : 0; return <td key={group.label} style={{ padding: 10, textAlign: 'right' }}>{count.toLocaleString()} <span style={{ color: '#64748b' }}>({pct}%)</span></td>; })}</tr>)}</tbody>
+                    </table>
+                  </div>
+                </>
+              ) : <div style={{ color: '#64748b', padding: 18, border: '1px dashed #cbd5e1', borderRadius: 12 }}>Noodles analysis tables will appear after SurveyCTO submissions are synced.</div>}
+              </div>
+            </section>
+          </section>
+        ) : page === 'decoded' ? (
+          <section style={{ display: 'grid', gap: 24, marginBottom: 24 }}>
+            <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+              <h1 style={{ marginTop: 0 }}>Decoded question view</h1>
+              <p style={{ color: '#4b5563', marginTop: -6 }}>This page shows the questionnaire questions and the human-readable responses for a selected submission, without the raw payload.</p>
+              <div style={{ display: 'flex', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+                <div style={{ flex: 1, minWidth: 220, padding: '10px 12px', borderRadius: 10, border: '1px solid #d1d5db', background: '#f8fafc', color: '#374151' }}>
+                  {decodedSubmissionKey || 'Loading the latest available submission…'}
+                </div>
+                <button
+                  onClick={() => loadLatestDecodedQuestions()}
+                  style={{ padding: '10px 12px', borderRadius: 10, border: 'none', background: '#2563eb', color: '#ffffff', cursor: 'pointer', fontWeight: 700 }}
+                >
+                  Reload latest view
+                </button>
+              </div>
+              {decodedLoading ? (
+                <div style={{ color: '#6b7280' }}>Loading decoded questions…</div>
+              ) : decodedQuestions.length > 0 ? (
+                <div style={{ display: 'grid', gap: 8 }}>
+                  {Object.entries(decodedQuestionGroups).map(([category, rows]) => {
+                    const isExpanded = Boolean(expandedDecodedCategories[category]);
+                    return (
+                      <section key={category} style={{ border: '1px solid #e2e8f0', borderRadius: 12, overflow: 'hidden', background: '#ffffff' }}>
+                        <button
+                          type="button"
+                          onClick={() => toggleDecodedCategory(category)}
+                          aria-expanded={isExpanded}
+                          style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '10px 12px', border: 'none', background: '#f8fafc', color: '#1e293b', cursor: 'pointer', textAlign: 'left', fontWeight: 700 }}
+                        >
+                          <span>{category}</span>
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: '#64748b', fontSize: 12, fontWeight: 600 }}>
+                            {rows.length} {rows.length === 1 ? 'response' : 'responses'}
+                            <span aria-hidden="true">{isExpanded ? '−' : '+'}</span>
+                          </span>
+                        </button>
+                        {isExpanded && (
+                          <div style={{ display: 'grid' }}>
+                            {rows.map((row, index) => (
+                              <div key={`${category}-${row.question}-${index}`} style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 0.9fr) minmax(0, 1.4fr)', gap: 16, padding: '9px 12px', borderTop: '1px solid #eef2f7' }}>
+                                <div style={{ fontSize: 13, fontWeight: 700, color: '#334155' }}>{row.question}</div>
+                                <div style={{ color: '#0f766e', fontSize: 13, overflowWrap: 'anywhere' }}>{row.response || '—'}</div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ color: '#6b7280', padding: 12, borderRadius: 12, border: '1px dashed #cbd5e1' }}>No decoded questions are available yet for the latest submission.</div>
+              )}
+            </div>
+          </section>
+        ) : page === 'admin' ? (
           <section style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.8fr', gap: 24, marginBottom: 24 }}>
             <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
               <h1 style={{ marginTop: 0 }}>Admin Dashboard</h1>
