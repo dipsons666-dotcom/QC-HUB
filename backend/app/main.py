@@ -42,7 +42,9 @@ from .models import (
 )
 from .decoded_questions import decode_submission_to_question_rows
 from .services.table_engine import (
+    PREFERRED_FILTER_FIELDS,
     available_filter_fields,
+    build_question_catalog,
     build_tables,
     load_metadata,
     load_questionnaire_xlsform,
@@ -1606,10 +1608,14 @@ def _analysis_tables_for_category(
             match_key = next((k for k in answers.keys() if k.lower() == response_filter_question.lower()), None)
             if not match_key:
                 continue
-            qmeta = _question(metadata, match_key)
+            metadata_key = next(
+                (key for key in metadata.get("questions", {}) if key.lower() == match_key.lower()),
+                match_key,
+            )
+            qmeta = _question(metadata, metadata_key)
             qtype = str(qmeta.get("type", "")) if qmeta else ""
             tokens = _answer_tokens(answers.get(match_key), qtype)
-            options = _options(metadata, match_key)
+            options = _options(metadata, metadata_key)
             labels = [_choice_label(options, t) for t in tokens]
             if any(str(l) == str(response_filter_value) for l in labels):
                 filtered.append(payload)
@@ -1623,11 +1629,31 @@ def _analysis_tables_for_category(
         selected_filter = filters[0]["field"]
     registry = load_template_registry(ANALYSIS_TEMPLATE_PATH, metadata, category) if ANALYSIS_TEMPLATE_PATH.exists() else None
     registry = registry or []
-    questions = [{"id": name, "label": str(metadata.get("questions", {}).get(name, {}).get("label") or title)} for name, title in registry]
+    available_question_fields = {
+        str(field_name)
+        for payload in payloads
+        for field_name in _answers(payload)
+    }
+    catalog = build_question_catalog(
+        metadata,
+        excluded_names=PREFERRED_FILTER_FIELDS,
+        available_fields=available_question_fields,
+    )
+    if catalog:
+        questions = [{"id": name, "label": label} for name, label in catalog]
+    else:
+        questions = [{"id": name, "label": str(metadata.get("questions", {}).get(name, {}).get("label") or title)} for name, title in registry]
     selected_question = next((item["id"] for item in questions if item["id"].lower() == (question_id or "").lower()), None)
     if selected_question is None and questions:
         selected_question = questions[0]["id"]
-    selected_registry = [item for item in registry if item[0] == selected_question] if selected_question else registry
+    selected_registry = [item for item in registry if item[0].lower() == selected_question.lower()] if selected_question else registry
+    if selected_question and catalog:
+        # The catalog is intentionally broader than the legacy report template.
+        # Use the label for the question the analyst actually selected, not the
+        # first catalog entry (which made every selected question appear as the
+        # same table and obscured its counts).
+        selected_label = next(item["label"] for item in questions if item["id"] == selected_question)
+        selected_registry = [(selected_question, selected_label)]
     tables = build_tables(
         payloads, metadata, category=category, registry=selected_registry,
         cut_fields=[selected_filter] if selected_filter else [],

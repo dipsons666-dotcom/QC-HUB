@@ -47,6 +47,8 @@ function App() {
   const [analysisTables, setAnalysisTables] = useState({ respondent_count: 0, tables: [], filters: [], filter_field: null, questions: [], question_id: null });
   const [selectedAnalysisTableId, setSelectedAnalysisTableId] = useState('');
   const [selectedAnalysisCut, setSelectedAnalysisCut] = useState('Total');
+  const [selectedAnalysisGroupLabels, setSelectedAnalysisGroupLabels] = useState([]);
+  const [showAnalysisFilterOptions, setShowAnalysisFilterOptions] = useState(false);
 
   const loadHomeData = () => {
     fetch(`${API_BASE}/api/qc/review-queue?limit=20`)
@@ -361,12 +363,20 @@ function App() {
         setAnalysisTables(tableData);
         setSelectedAnalysisTableId(tableData.question_id || tableData.tables?.[0]?.id || '');
         setSelectedAnalysisCut(tableData.filter_field || 'Total');
+        const loadedTable = tableData.tables?.find((table) => table.id === (tableData.question_id || tableData.tables?.[0]?.id)) || tableData.tables?.[0];
+        const loadedGroups = loadedTable?.cuts?.find((cut) => cut.field === tableData.filter_field)?.groups || [];
+        setSelectedAnalysisGroupLabels((current) => {
+          const available = loadedGroups.map((group) => group.label);
+          const retained = current.filter((label) => available.includes(label));
+          return retained.length ? retained : available;
+        });
         if (responseQuestion && responseValue) setAppliedResponseFilter({ question: responseQuestion, value: responseValue });
         else setAppliedResponseFilter(null);
       })
       .catch(() => {
         setInsights({ respondent_count: 0, categories: [], sectors: [] });
         setAnalysisTables({ respondent_count: 0, tables: [], filters: [], filter_field: null, questions: [], question_id: null });
+        setSelectedAnalysisGroupLabels([]);
         setAppliedResponseFilter(null);
       })
       .finally(() => setInsightsLoading(false));
@@ -425,8 +435,9 @@ function App() {
 
   const selectedAnalysisGroups = useMemo(() => {
     if (!selectedAnalysisTable || selectedAnalysisCut === 'Total') return [];
-    return selectedAnalysisTable.cuts?.find((cut) => cut.field === selectedAnalysisCut)?.groups || [];
-  }, [selectedAnalysisTable, selectedAnalysisCut]);
+    const groups = selectedAnalysisTable.cuts?.find((cut) => cut.field === selectedAnalysisCut)?.groups || [];
+    return groups.filter((group) => selectedAnalysisGroupLabels.includes(group.label));
+  }, [selectedAnalysisTable, selectedAnalysisCut, selectedAnalysisGroupLabels]);
 
   const selectedAnalysisCutDetails = useMemo(
     () => selectedAnalysisTable?.cuts?.find((cut) => cut.field === selectedAnalysisCut),
@@ -601,13 +612,28 @@ function App() {
               </div>
               {analysisTables.tables.length > 0 ? (
                 <>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0 14px', flexWrap: 'wrap' }}>
-                    <label htmlFor="analysis-cut" style={{ color: '#52667d', fontSize: 13, fontWeight: 700 }}>Filter / break down by</label>
-                    <select id="analysis-cut" value={selectedAnalysisCut} onChange={(event) => { const field = event.target.value; if (field === 'Total') setSelectedAnalysisCut('Total'); else loadInsights(field, selectedAnalysisTableId); }} style={{ padding: '8px 10px', border: '1px solid #cbd5e1', borderRadius: 8, background: '#fff', color: '#1e3a5f' }}>
-                      <option value="Total">Total sample</option>
-                      {(analysisTables.filters || []).map((filter) => <option key={filter.field} value={filter.field}>{filter.label}</option>)}
-                    </select>
-                    {selectedAnalysisCut !== 'Total' && <span style={{ color: '#64748b', fontSize: 12 }}>Each column shows N and % within that demographic group.</span>}
+                  <div style={{ display: 'flex', alignItems: 'end', gap: 10, margin: '4px 0 14px', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'grid', gap: 5, minWidth: 0 }}>
+                      <label htmlFor="analysis-cut" style={{ color: '#52667d', fontSize: 13, fontWeight: 700 }}>Filter question</label>
+                      <select id="analysis-cut" value={selectedAnalysisCut} onChange={(event) => { const field = event.target.value; setSelectedAnalysisGroupLabels([]); if (field === 'Total') setSelectedAnalysisCut('Total'); else loadInsights(field, selectedAnalysisTableId); }} style={{ width: 260, maxWidth: '100%', padding: '8px 10px', border: '1px solid #cbd5e1', borderRadius: 8, background: '#fff', color: '#1e3a5f' }}>
+                        <option value="Total">Total sample</option>
+                        {(analysisTables.filters || []).map((filter) => <option key={filter.field} value={filter.field}>{filter.label}</option>)}
+                      </select>
+                    </div>
+                    {selectedAnalysisCut !== 'Total' && <div style={{ display: 'grid', gap: 5, minWidth: 0, position: 'relative' }}>
+                      <label htmlFor="analysis-cut-options" style={{ color: '#52667d', fontSize: 13, fontWeight: 700 }}>Filter options</label>
+                      <button id="analysis-cut-options" type="button" onClick={() => setShowAnalysisFilterOptions((open) => !open)} style={{ width: 260, maxWidth: '100%', padding: '8px 10px', border: '1px solid #cbd5e1', borderRadius: 8, background: '#fff', color: '#1e3a5f', cursor: 'pointer', textAlign: 'left', display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                        <span>{selectedAnalysisGroupLabels.length === (selectedAnalysisCutDetails?.groups || []).length ? `All ${selectedAnalysisGroupLabels.length} options` : `${selectedAnalysisGroupLabels.length} option${selectedAnalysisGroupLabels.length === 1 ? '' : 's'} selected`}</span><span>⌄</span>
+                      </button>
+                      {showAnalysisFilterOptions && <div style={{ position: 'absolute', zIndex: 10, top: 67, left: 0, width: 300, maxWidth: 'calc(100vw - 48px)', maxHeight: 280, overflowY: 'auto', padding: 10, border: '1px solid #cbd5e1', borderRadius: 10, background: '#fff', boxShadow: '0 12px 24px rgba(15, 23, 42, 0.16)' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, marginBottom: 8 }}>
+                          <button type="button" onClick={() => setSelectedAnalysisGroupLabels((selectedAnalysisCutDetails?.groups || []).map((group) => group.label))} style={{ border: 'none', background: 'transparent', color: '#155dc4', cursor: 'pointer', fontSize: 12, fontWeight: 700 }}>Select all</button>
+                          <button type="button" onClick={() => setSelectedAnalysisGroupLabels([])} style={{ border: 'none', background: 'transparent', color: '#155dc4', cursor: 'pointer', fontSize: 12, fontWeight: 700 }}>Clear</button>
+                        </div>
+                        <div style={{ display: 'grid', gap: 4 }}>{(selectedAnalysisCutDetails?.groups || []).map((group) => <label key={group.label} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 4px', cursor: 'pointer', fontSize: 13 }}><input type="checkbox" checked={selectedAnalysisGroupLabels.includes(group.label)} onChange={() => setSelectedAnalysisGroupLabels((current) => current.includes(group.label) ? current.filter((label) => label !== group.label) : [...current, group.label])} /><span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{group.label} ({group.base.toLocaleString()})</span></label>)}</div>
+                      </div>}
+                    </div>}
+                    {selectedAnalysisCut !== 'Total' && <span style={{ color: '#64748b', fontSize: 12, maxWidth: 260 }}>Choose one or more options. Each column shows N and % within that group.</span>}
                     {selectedAnalysisCutDetails?.truncated && <span style={{ color: '#9a3412', fontSize: 12 }}>Showing the {selectedAnalysisGroups.length} largest values out of {selectedAnalysisCutDetails.total_groups}.</span>}
                   </div>
                   <div style={{ overflowX: 'auto' }}>
