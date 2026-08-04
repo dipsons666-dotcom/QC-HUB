@@ -80,6 +80,11 @@ class ReviewQueueItem(BaseModel):
     updated_at: datetime
     resolved_at: datetime | None = None
     resolution_note: str | None = None
+    assigned_to_user_id: str | None = None
+    assigned_to_name: str | None = None
+    flag_name: str | None = None
+    interviewer: str | None = None
+    evidence: str | None = None
 
 
 class ReviewQueueResponse(BaseModel):
@@ -90,6 +95,10 @@ class ReviewQueueResponse(BaseModel):
 class IssueActionRequest(BaseModel):
     status: Literal["pending_review", "in_progress", "resolved", "rejected"]
     resolution_note: str | None = None
+
+
+class IssueAssignmentRequest(BaseModel):
+    staff_id: str | None = None
 
 
 class RawSurveyCTOItem(BaseModel):
@@ -182,6 +191,7 @@ class StaffMemberCreate(BaseModel):
     username: str
     email: str
     role: str = "reviewer"
+    password: str = Field(min_length=6)
 
 
 class StaffMemberResponse(BaseModel):
@@ -190,6 +200,17 @@ class StaffMemberResponse(BaseModel):
     email: str
     role: str
     created_at: datetime
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    staff_id: str
+    username: str
+    role: str
 
 
 class AdminDashboardResponse(BaseModel):

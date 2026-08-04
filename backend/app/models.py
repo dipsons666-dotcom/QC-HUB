@@ -180,6 +180,8 @@ class StaffMember(Base):
     username: Mapped[str] = Column(Text, nullable=False)
     email: Mapped[str] = Column(Text, nullable=False, unique=True)
     role: Mapped[str] = Column(Text, nullable=False, default="reviewer")
+    password_hash: Mapped[str] = Column(Text, nullable=False, default="")
+    is_active: Mapped[bool] = Column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 

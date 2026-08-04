@@ -56,6 +56,8 @@ from .services.table_engine import (
     _options,
 )
 from .services.table_export import write_analysis_workbook
+from .services.main_survey_qc import evaluate_main_survey
+from .services.passwords import hash_password, verify_password
 from .schemas import (
     AdminDashboardResponse,
     AnalysisTableResponse,
@@ -67,6 +69,9 @@ from .schemas import (
     InsightDistributionItem,
     InsightsOverviewResponse,
     IssueActionRequest,
+    IssueAssignmentRequest,
+    LoginRequest,
+    LoginResponse,
     ProcessingResponse,
     QCResultResponse,
     RawSurveyCTOItem,
@@ -243,6 +248,16 @@ def _get_cors_origin_regex() -> str | None:
 async def lifespan(_: FastAPI):
     create_schemas()
     Base.metadata.create_all(bind=get_engine())
+    # Bootstrap the initial local administrator once. Change this password
+    # immediately after first deployment through the staff-management flow.
+    session = get_session_local()()
+    try:
+        admin = session.execute(select(StaffMember).where(StaffMember.username == "Superadmin")).scalars().first()
+        if admin is None:
+            session.add(StaffMember(username="Superadmin", email="superadmin@qc-hub.local", role="admin", password_hash=hash_password("admin123"), is_active=True))
+            session.commit()
+    finally:
+        session.close()
     yield
 
 
@@ -284,6 +299,15 @@ _import_worker_stop_event: threading.Event | None = None
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+def login(payload: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse:
+    username = payload.username.strip()
+    member = db.execute(select(StaffMember).where(StaffMember.username == username)).scalars().first()
+    if member is None or not member.is_active or not verify_password(payload.password, member.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return LoginResponse(staff_id=str(member.staff_id), username=member.username, role=member.role)
 
 
 @app.get("/api/import/sync-status")
@@ -798,6 +822,7 @@ def import_surveycto(payload: SurveyCTOImportRequest, db: Session = Depends(get_
     db.add(raw_submission)
     db.add(import_job)
     db.commit()
+    run_main_survey_qc(db)
     _refresh_analysis_workbook(db)
     db.refresh(raw_submission)
     db.refresh(import_job)
@@ -914,6 +939,7 @@ def sync_survey_platform_submissions(
 
     db.commit()
     if stored or updated:
+        run_main_survey_qc(db)
         _refresh_analysis_workbook(db)
 
     _last_surveycto_sync["stored"] = stored
@@ -1053,6 +1079,9 @@ def _mirror_duckdb_raw_submissions() -> tuple[int, int]:
             stored += 1
         session.commit()
         if stored or updated:
+            # Background imports write through a separate path; give them the
+            # same automatic QC treatment as request-based imports.
+            run_main_survey_qc(session)
             _refresh_analysis_workbook(session)
         return stored, updated
     finally:
@@ -1368,12 +1397,18 @@ def evaluate_next_rule(db: Session = Depends(get_db)) -> QCResultResponse:
 def get_review_queue(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    assignee_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> ReviewQueueResponse:
-    total_count = db.execute(select(func.count()).select_from(IssueQueue)).scalar_one()
+    base_query = select(IssueQueue)
+    count_query = select(func.count()).select_from(IssueQueue)
+    if assignee_id:
+        base_query = base_query.where(IssueQueue.assigned_to_user_id == assignee_id)
+        count_query = count_query.where(IssueQueue.assigned_to_user_id == assignee_id)
+    total_count = db.execute(count_query).scalar_one()
     issues = (
         db.execute(
-            select(IssueQueue)
+            base_query
             .order_by(IssueQueue.created_at.asc())
             .offset(offset)
             .limit(limit)
@@ -1381,25 +1416,26 @@ def get_review_queue(
         .scalars()
         .all()
     )
-    return ReviewQueueResponse(
-        issues=[
-            ReviewQueueItem(
-                issue_id=issue.issue_id,
-                submission_key=issue.submission_key,
-                case_id=issue.case_id,
-                issue_status=issue.issue_status,
-                status=issue.issue_status,
-                issue_summary=issue.issue_summary,
-                severity=issue.severity if hasattr(issue, "severity") else "medium",
-                created_at=issue.created_at,
-                updated_at=issue.updated_at,
-                resolved_at=issue.resolved_at,
-                resolution_note=issue.resolution_note,
-            )
-            for issue in issues
-        ],
-        count=total_count,
-    )
+    staff_by_id = {member.staff_id: member.username for member in db.execute(select(StaffMember)).scalars().all()}
+    results_by_id = {result.rule_result_id: result for result in db.execute(select(RuleResult)).scalars().all()}
+    raw_by_key = {raw.submission_key: raw for raw in db.execute(select(RawSurveyCTOSubmission)).scalars().all()}
+    def serialize_issue(issue: IssueQueue) -> ReviewQueueItem:
+        result = results_by_id.get(issue.rule_result_id) if issue.rule_result_id else None
+        raw_submission = raw_by_key.get(issue.submission_key) if issue.submission_key else None
+        raw_payload = raw_submission.raw_payload if raw_submission is not None else {}
+        interviewer = raw_payload.get("Interviewer") or raw_payload.get("username") or "Unknown"
+        return ReviewQueueItem(
+            issue_id=str(issue.issue_id), submission_key=issue.submission_key, case_id=issue.case_id,
+            issue_status=issue.issue_status, status=issue.issue_status, issue_summary=issue.issue_summary,
+            severity=issue.severity if hasattr(issue, "severity") else "medium", created_at=issue.created_at,
+            updated_at=issue.updated_at, resolved_at=issue.resolved_at, resolution_note=issue.resolution_note,
+            assigned_to_user_id=str(issue.assigned_to_user_id) if issue.assigned_to_user_id else None,
+            assigned_to_name=staff_by_id.get(issue.assigned_to_user_id) if issue.assigned_to_user_id else None,
+            flag_name=result.rule_code if result else None, interviewer=str(interviewer),
+            evidence=result.result_message if result else issue.issue_summary,
+        )
+
+    return ReviewQueueResponse(issues=[serialize_issue(issue) for issue in issues], count=total_count)
 
 
 @app.get("/api/admin/staff", response_model=list[StaffMemberResponse])
@@ -1425,6 +1461,8 @@ def create_staff_member(payload: StaffMemberCreate, db: Session = Depends(get_db
         username=payload.username.strip(),
         email=payload.email.strip(),
         role=payload.role.strip() or "reviewer",
+        password_hash=hash_password(payload.password),
+        is_active=True,
     )
     db.add(staff_member)
     try:
@@ -1639,6 +1677,8 @@ def _analysis_tables_for_category(
         excluded_names=PREFERRED_FILTER_FIELDS,
         available_fields=available_question_fields,
     )
+
+
     if catalog:
         questions = [{"id": name, "label": label} for name, label in catalog]
     else:
@@ -1661,6 +1701,60 @@ def _analysis_tables_for_category(
     if not tables:
         raise HTTPException(status_code=404, detail=f"No table registry is configured for category '{category}'")
     return len(payloads), tables, filters, selected_filter, questions, selected_question
+
+
+@app.post("/api/qc/run-main-survey")
+def run_main_survey_qc(db: Session = Depends(get_db)) -> dict[str, int]:
+    """Evaluate the documented batch QC flags and add new outliers to review."""
+    submissions = db.execute(select(RawSurveyCTOSubmission)).scalars().all()
+    flags = evaluate_main_survey((row.submission_key, row.raw_payload) for row in submissions)
+    # Rule results have a database foreign key to the rule catalogue.  The
+    # batch rules are code-defined, so seed any missing catalogue entries
+    # before persisting their outcomes (including on existing deployments).
+    flag_codes = {flag["code"] for flag in flags}
+    defined_codes = set(db.execute(select(RuleDefinition.rule_code).where(RuleDefinition.rule_code.in_(flag_codes))).scalars().all()) if flag_codes else set()
+    for code in flag_codes - defined_codes:
+        db.add(RuleDefinition(
+            rule_code=code,
+            name=code.replace("MAIN_", "").replace("_", " ").title(),
+            instrument_code="main",
+            target_table="raw.surveycto_submission",
+            severity="high",
+            rule_type="batch",
+            description="Automatically evaluated Main Survey quality-control rule.",
+            recommended_action="Review the affected submission and its supporting evidence.",
+            is_active=True,
+        ))
+    if flag_codes - defined_codes:
+        db.flush()
+    submissions_by_key = {row.submission_key: row for row in submissions}
+    existing_results = set(db.execute(select(RuleResult.rule_code, RuleResult.submission_key)).all())
+    created = 0
+    for flag in flags:
+        if (flag["code"], flag["submission_key"]) in existing_results:
+            continue
+        raw = submissions_by_key.get(flag["submission_key"])
+        result = RuleResult(rule_code=flag["code"], instrument_code=raw.instrument_code if raw else "main", submission_key=flag["submission_key"], table_name="raw.surveycto_submission", severity=flag["severity"], result_status="open", result_message=flag["message"])
+        db.add(result); db.flush()
+        db.add(IssueQueue(rule_result_id=result.rule_result_id, instrument_code=result.instrument_code, submission_key=result.submission_key, issue_status="pending_review", severity=result.severity, issue_summary=f"{flag['code']}: {flag['message']}"))
+        created += 1
+    db.commit()
+    return {"evaluated": len(submissions), "flags_found": len(flags), "issues_created": created}
+
+
+@app.put("/api/qc/issues/{issue_id}/assignment", response_model=ReviewQueueItem)
+def assign_issue(issue_id: str, payload: IssueAssignmentRequest, db: Session = Depends(get_db)) -> ReviewQueueItem:
+    issue = db.get(IssueQueue, issue_id)
+    if issue is None:
+        raise HTTPException(status_code=404, detail="Issue not found")
+    assignee = db.get(StaffMember, payload.staff_id) if payload.staff_id else None
+    if payload.staff_id and assignee is None:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    issue.assigned_to_user_id = assignee.staff_id if assignee else None
+    issue.assigned_to_role = assignee.role if assignee else None
+    issue.updated_at = datetime.now(timezone.utc)
+    db.commit(); db.refresh(issue)
+    return ReviewQueueItem(issue_id=str(issue.issue_id), submission_key=issue.submission_key, case_id=issue.case_id, issue_status=issue.issue_status, status=issue.issue_status, issue_summary=issue.issue_summary, severity=issue.severity, created_at=issue.created_at, updated_at=issue.updated_at, resolved_at=issue.resolved_at, resolution_note=issue.resolution_note, assigned_to_user_id=str(issue.assigned_to_user_id) if issue.assigned_to_user_id else None, assigned_to_name=assignee.username if assignee else None)
 
 
 def _refresh_analysis_workbook(db: Session, category: str = "noodles") -> None:
@@ -1902,7 +1996,7 @@ def update_issue_action(issue_id: str, payload: IssueActionRequest, db: Session 
     db.refresh(issue)
 
     return ReviewQueueItem(
-        issue_id=issue.issue_id,
+        issue_id=str(issue.issue_id),
         submission_key=issue.submission_key,
         case_id=issue.case_id,
         issue_status=issue.issue_status,

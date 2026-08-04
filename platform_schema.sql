@@ -383,12 +383,15 @@ CREATE INDEX IF NOT EXISTS idx_main_data_error_audit_synced
 
 CREATE TABLE IF NOT EXISTS qc.rule_definition (
     rule_code text PRIMARY KEY,
+    name text NOT NULL,
     instrument_code text NOT NULL,
     target_table text NOT NULL,
     target_field text,
     severity text NOT NULL,
     rule_type text NOT NULL,
     description text NOT NULL,
+    operator text,
+    threshold double precision,
     logic_sql text,
     logic_python text,
     recommended_action text,

@@ -14,7 +14,13 @@ function App() {
   const [selectedIssue, setSelectedIssue] = useState(null);
   const [rawImports, setRawImports] = useState([]);
   const [rawSubmissionCount, setRawSubmissionCount] = useState(0);
-  const [page, setPage] = useState('insights');
+  const [page, setPage] = useState('home');
+  const [sessionRole, setSessionRole] = useState('');
+  const [sessionUserId, setSessionUserId] = useState('');
+  const [loginName, setLoginName] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [showRawBrowser, setShowRawBrowser] = useState(false);
   const [syncStatus, setSyncStatus] = useState('');
   const [dashboard, setDashboard] = useState(null);
   const [staffMembers, setStaffMembers] = useState([]);
@@ -31,7 +37,7 @@ function App() {
   const [columnFilters, setColumnFilters] = useState({});
   const [interpretEnabled, setInterpretEnabled] = useState(true);
   const [xlsformMetadata, setXlsformMetadata] = useState(null);
-  const [newStaff, setNewStaff] = useState({ username: '', email: '', role: 'reviewer' });
+  const [newStaff, setNewStaff] = useState({ username: '', email: '', password: '', role: 'reviewer' });
   const [adminError, setAdminError] = useState('');
   const [queuedImports, setQueuedImports] = useState([]);
   const [queuedCount, setQueuedCount] = useState(0);
@@ -51,12 +57,18 @@ function App() {
   const [showAnalysisFilterOptions, setShowAnalysisFilterOptions] = useState(false);
 
   const loadHomeData = () => {
-    fetch(`${API_BASE}/api/qc/review-queue?limit=20`)
+    fetch(`${API_BASE}/api/admin/dashboard`)
+      .then((response) => response.json())
+      .then((data) => setDashboard(data))
+      .catch(() => setDashboard(null));
+
+    const queueQuery = sessionRole === 'admin' ? 'limit=20' : `limit=20&assignee_id=${encodeURIComponent(sessionUserId)}`;
+    fetch(`${API_BASE}/api/qc/review-queue?${queueQuery}`)
       .then((response) => response.json())
       .then((data) => {
         const loadedIssues = data.issues || [];
         setIssues(loadedIssues);
-        setSelectedIssue(loadedIssues[0] || null);
+        setSelectedIssue(null);
       })
       .catch(() => {
         setIssues([]);
@@ -137,18 +149,18 @@ function App() {
       .then((d) => setSyncDetails(d))
       .catch(() => setSyncDetails(null));
 
-    loadRawDataPage(0, false, '', rawDataPageSize);
+    if (showRawBrowser) loadRawDataPage(0, false, '', rawDataPageSize);
   };
 
   useEffect(() => {
     loadHomeData();
-  }, []);
+  }, [sessionRole, sessionUserId]);
 
   useEffect(() => {
-    if (page === 'admin') {
+    if (page === 'admin' || page === 'raw') {
       loadAdminData();
     }
-  }, [page]);
+  }, [page, showRawBrowser]);
 
   useEffect(() => {
     if (page === 'decoded') {
@@ -225,11 +237,43 @@ function App() {
       })
       .then((created) => {
         setStaffMembers((current) => [...current, created]);
-        setNewStaff({ username: '', email: '', role: 'reviewer' });
+        setNewStaff({ username: '', email: '', password: '', role: 'reviewer' });
       })
       .catch(() => {
         setAdminError('Unable to add staff. Check the email and try again.');
       });
+  };
+
+  const assignIssue = (issueId, staffId) => {
+    fetch(`${API_BASE}/api/qc/issues/${issueId}/assignment`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ staff_id: staffId || null }),
+    })
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((updated) => {
+        setIssues((current) => current.map((issue) => issue.issue_id === updated.issue_id ? updated : issue));
+        setSelectedIssue(updated);
+      });
+  };
+
+  const updateIssueStatus = (status) => {
+    if (!selectedIssue) return;
+    const resolutionNote = status === 'resolved' ? window.prompt('Add a short resolution note for the audit trail:', selectedIssue.resolution_note || '') : selectedIssue.resolution_note;
+    if (status === 'resolved' && resolutionNote === null) return;
+    fetch(`${API_BASE}/api/qc/issues/${selectedIssue.issue_id}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status, resolution_note: resolutionNote || null }),
+    }).then((response) => response.ok ? response.json() : Promise.reject()).then((updated) => {
+      setIssues((current) => current.map((issue) => issue.issue_id === updated.issue_id ? { ...issue, ...updated } : issue));
+      setSelectedIssue((current) => ({ ...current, ...updated }));
+      loadAdminData();
+    });
+  };
+
+  const runMainSurveyQC = () => {
+    fetch(`${API_BASE}/api/qc/run-main-survey`, { method: 'POST' })
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then(() => { loadHomeData(); loadAdminData(); });
   };
 
   const stats = useMemo(() => {
@@ -481,11 +525,34 @@ function App() {
       });
   };
 
+  if (!sessionRole) {
+    return (
+      <main style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 24, fontFamily: 'Arial, sans-serif', background: 'radial-gradient(circle at top left, #dbeafe, transparent 36%), linear-gradient(135deg, #071c3d, #164e9c)' }}>
+        <section style={{ width: 'min(960px, 100%)', display: 'grid', gridTemplateColumns: '1.15fr .85fr', overflow: 'hidden', borderRadius: 28, background: '#fff', boxShadow: '0 28px 80px rgba(2, 18, 48, .35)', animation: 'fadeUp .5s ease both' }}>
+          <div style={{ padding: '56px 48px', color: '#fff', background: 'linear-gradient(145deg, #0f2a57, #1672d4)' }}>
+            <div style={{ fontWeight: 800, letterSpacing: '.16em', fontSize: 12 }}>QC HUB</div>
+            <h1 style={{ fontSize: 42, lineHeight: 1.08, margin: '20px 0' }}>Quality control that makes every survey defensible.</h1>
+            <p style={{ lineHeight: 1.65, opacity: .9 }}>Review evidence-led outliers, assign work, and keep the complete audit trail in one place.</p>
+          </div>
+          <form onSubmit={(event) => { event.preventDefault(); setLoginError(''); fetch(`${API_BASE}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: loginName, password: loginPassword }) }).then(async (response) => { if (!response.ok) throw new Error((await response.json()).detail || 'Unable to sign in'); return response.json(); }).then((account) => { setSessionRole(account.role); setSessionUserId(account.staff_id); setLoginName(account.username); setPage('home'); }).catch((error) => setLoginError(error.message)); }} style={{ padding: 48, display: 'grid', alignContent: 'center', gap: 16 }}>
+            <div><div style={{ color: '#2563eb', fontWeight: 800, fontSize: 12, letterSpacing: '.12em' }}>WELCOME BACK</div><h2 style={{ fontSize: 28, margin: '8px 0' }}>Sign in to your workspace</h2></div>
+            <label style={{ display: 'grid', gap: 7, color: '#475569', fontWeight: 700, fontSize: 13 }}>Username<input required value={loginName} onChange={(event) => setLoginName(event.target.value)} placeholder="Your username" style={{ padding: '13px 14px', border: '1px solid #cbd5e1', borderRadius: 10 }} /></label>
+            <label style={{ display: 'grid', gap: 7, color: '#475569', fontWeight: 700, fontSize: 13 }}>Password<input required type="password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} placeholder="Your password" style={{ padding: '13px 14px', border: '1px solid #cbd5e1', borderRadius: 10 }} /></label>
+            <button style={{ padding: 14, border: 0, borderRadius: 10, background: '#1368ce', color: '#fff', fontWeight: 800, cursor: 'pointer' }}>Sign in</button>
+            {loginError && <div style={{ color: '#b91c1c', fontWeight: 700, fontSize: 13 }}>{loginError}</div>}
+          </form>
+        </section>
+        <style>{'@keyframes fadeUp { from { opacity:0; transform: translateY(14px) } to { opacity:1; transform: translateY(0) } }'}</style>
+      </main>
+    );
+  }
+
   return (
     <div style={{ fontFamily: 'Arial, sans-serif', background: '#f3f4f6', minHeight: '100vh', color: '#111827' }}>
       <div style={{ maxWidth: 1280, margin: '0 auto', padding: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-          <div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+            <div style={{ fontWeight: 800, color: '#163c70', marginRight: 8 }}>QC Hub</div>
             <button
               onClick={() => setPage('insights')}
               style={{
@@ -512,9 +579,9 @@ function App() {
                 fontWeight: 700,
               }}
             >
-              Home
+              Review workspace
             </button>
-            <button
+            {sessionRole === 'admin' && <button
               onClick={() => setPage('admin')}
               style={{
                 padding: '12px 18px',
@@ -526,8 +593,14 @@ function App() {
               }}
             >
               Admin Portal
-            </button>
-            <button
+            </button>}
+            {sessionRole === 'admin' && <button
+              onClick={() => setPage('raw')}
+              style={{ padding: '12px 18px', borderRadius: 12, border: page === 'raw' ? '2px solid #2563eb' : '1px solid #d1d5db', background: page === 'raw' ? '#eff6ff' : '#ffffff', cursor: 'pointer', fontWeight: 700 }}
+            >
+              Raw data
+            </button>}
+            {sessionRole === 'admin' && <button
               onClick={() => setPage('decoded')}
               style={{
                 padding: '12px 18px',
@@ -539,9 +612,10 @@ function App() {
               }}
             >
               Decoded Questions
-            </button>
+            </button>}
           </div>
-          <div style={{ display: 'grid', gap: 8 }}>
+          {sessionRole === 'admin' && <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <span style={{ color: '#64748b', fontSize: 13, fontWeight: 700 }}>{sessionRole === 'admin' ? 'Administrator' : 'Staff reviewer'} {loginName ? `· ${loginName}` : ''}</span>
             <button
               onClick={handleSync}
               style={{ padding: '12px 18px', borderRadius: 12, border: 'none', background: '#2563eb', color: '#ffffff', cursor: 'pointer', fontWeight: 700 }}
@@ -553,7 +627,9 @@ function App() {
                 {syncStatus}
               </div>
             )}
-          </div>
+            <button onClick={() => { setSessionRole(''); setSessionUserId(''); setLoginName(''); }} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', background: '#fff', color: '#334155', cursor: 'pointer', fontWeight: 700 }}>Sign out</button>
+          </div>}
+          {sessionRole !== 'admin' && <button onClick={() => { setSessionRole(''); setSessionUserId(''); setLoginName(''); }} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', background: '#fff', color: '#334155', cursor: 'pointer', fontWeight: 700 }}>Sign out</button>}
         </div>
 
         {page === 'insights' ? (
@@ -702,6 +778,13 @@ function App() {
               )}
             </div>
           </section>
+        ) : page === 'raw' ? (
+          <section style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'end', marginBottom: 18, flexWrap: 'wrap' }}><div><div style={{ color: '#2563eb', fontSize: 12, letterSpacing: '.12em', fontWeight: 800 }}>ADMIN ONLY</div><h1 style={{ margin: '6px 0' }}>Raw SurveyCTO data</h1><p style={{ margin: 0, color: '#64748b' }}>Select a submission to inspect its collected fields and responses.</p></div><div style={{ color: '#64748b' }}>{rawDataTotalCount.toLocaleString()} submissions</div></div>
+            <input value={rawDataSearch} onChange={(event) => { const next = event.target.value; setRawDataSearch(next); loadRawDataPage(0, false, next, rawDataPageSize); }} placeholder="Search a submission or field" style={{ width: 'min(520px, 100%)', boxSizing: 'border-box', padding: '12px 14px', borderRadius: 10, border: '1px solid #cbd5e1', marginBottom: 16 }} />
+            <div style={{ display: 'grid', gap: 10 }}>{rawDataTable.rows.map((row, index) => <button key={`${row.submission_key || index}`} onClick={() => setSelectedRawRecord(row)} style={{ textAlign: 'left', display: 'flex', justifyContent: 'space-between', gap: 16, padding: 16, borderRadius: 12, border: '1px solid #e2e8f0', background: '#fff', cursor: 'pointer' }}><div><strong>{row.submission_key || `Submission ${index + 1}`}</strong><div style={{ color: '#64748b', fontSize: 13, marginTop: 5 }}>{row.username || row.Interviewer || 'Interviewer not recorded'} · {row.SubmissionDate || row.fetched_at || 'Date not recorded'}</div></div><span style={{ color: '#155dc4', fontWeight: 800 }}>Inspect →</span></button>)}</div>
+            <div style={{ marginTop: 16, display: 'flex', justifyContent: 'space-between' }}><button onClick={() => loadRawDataPage(Math.max(0, rawDataOffset - rawDataPageSize), false, rawDataSearch, rawDataPageSize)} disabled={rawDataOffset === 0}>Previous</button><button onClick={() => loadRawDataPage(rawDataOffset + rawDataPageSize, false, rawDataSearch, rawDataPageSize)} disabled={!rawDataHasMore}>Next</button></div>
+          </section>
         ) : page === 'admin' ? (
           <section style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.8fr', gap: 24, marginBottom: 24 }}>
             <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
@@ -724,10 +807,20 @@ function App() {
               <div style={{ color: '#6b7280' }}>
                 Last sync: {dashboard?.last_sync_at ? formatDate(dashboard.last_sync_at) : 'Not available'}
               </div>
+              <div style={{ marginTop: 18, paddingTop: 18, borderTop: '1px solid #e2e8f0' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+                  <div><strong>Outlier review</strong><div style={{ color: '#64748b', fontSize: 13, marginTop: 4 }}>Select any flagged submission to inspect its reason, evidence, and assignment.</div></div>
+                  <button onClick={() => setPage('home')} style={{ padding: '9px 12px', border: 0, borderRadius: 9, background: '#dbeafe', color: '#155dc4', cursor: 'pointer', fontWeight: 800 }}>Open review queue</button>
+                </div>
+                <div style={{ display: 'grid', gap: 8, marginTop: 12, maxHeight: 190, overflow: 'auto' }}>
+                  {issues.slice(0, 5).map((issue) => <button key={issue.issue_id} onClick={() => { setSelectedIssue(issue); setPage('home'); }} style={{ textAlign: 'left', padding: '10px 12px', border: '1px solid #e2e8f0', background: '#fff', borderRadius: 10, cursor: 'pointer' }}><strong style={{ color: '#b91c1c' }}>{issue.flag_name || 'QC flag'}</strong><span style={{ color: '#475569', fontSize: 13 }}> · {issue.evidence || issue.issue_summary}</span></button>)}
+                </div>
+              </div>
             </div>
 
             <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
-              <h2 style={{ marginTop: 0 }}>SurveyCTO raw data browser</h2>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}><div><h2 style={{ margin: 0 }}>SurveyCTO raw data browser</h2><div style={{ color: '#64748b', fontSize: 13, marginTop: 5 }}>Kept out of the way until it is needed.</div></div><button onClick={() => setShowRawBrowser((open) => !open)} style={{ padding: '9px 12px', border: 0, borderRadius: 9, background: '#eff6ff', color: '#155dc4', cursor: 'pointer', fontWeight: 800 }}>{showRawBrowser ? 'Hide raw data' : 'View raw data'}</button></div>
+              {showRawBrowser && <div style={{ animation: 'fadeUp .25s ease both' }}>
               <div style={{ overflowX: 'auto', marginTop: 16 }}>
                 <div style={{ display: 'flex', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
                   <input
@@ -875,6 +968,7 @@ function App() {
                   </>
                 )}
               </div>
+              </div>}
             </div>
 
             <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
@@ -891,6 +985,15 @@ function App() {
                   onChange={(e) => setNewStaff({ ...newStaff, email: e.target.value })}
                   placeholder="Email"
                   type="email"
+                  style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }}
+                />
+                <input
+                  value={newStaff.password}
+                  onChange={(e) => setNewStaff({ ...newStaff, password: e.target.value })}
+                  placeholder="Temporary password (minimum 6 characters)"
+                  type="password"
+                  minLength={6}
+                  required
                   style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }}
                 />
                 <select
@@ -997,10 +1100,11 @@ function App() {
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 14 }}>
             {[
-              { label: 'Total issues', value: stats.total, accent: '#1d4ed8' },
-              { label: 'High severity', value: stats.highSeverity, accent: '#dc2626' },
-              { label: 'Medium severity', value: stats.mediumSeverity, accent: '#f59e0b' },
-              { label: 'Pending review', value: stats.pending, accent: '#059669' },
+              { label: 'Total issues', value: dashboard?.issue_count ?? stats.total, accent: '#1d4ed8' },
+              { label: 'High severity', value: dashboard?.high_severity_count ?? stats.highSeverity, accent: '#dc2626' },
+              { label: 'Medium severity', value: dashboard?.medium_severity_count ?? stats.mediumSeverity, accent: '#f59e0b' },
+              { label: 'Pending review', value: dashboard?.pending_review_count ?? stats.pending, accent: '#059669' },
+              { label: 'Last data pull', value: dashboard?.last_sync_at ? formatDate(dashboard.last_sync_at) : 'Not yet pulled', accent: '#2563eb' },
             ].map((card) => (
               <div key={card.label} style={{ background: '#ffffff', borderRadius: 16, padding: 18, boxShadow: '0 8px 30px rgba(15, 23, 42, 0.08)' }}>
                 <div style={{ fontSize: 13, fontWeight: 700, color: '#6b7280', marginBottom: 10 }}>{card.label}</div>
@@ -1022,7 +1126,7 @@ function App() {
         </section>
 
         <section style={{ display: 'grid', gridTemplateColumns: '1fr 1.25fr', gap: 24 }}>
-          <div style={{ background: '#ffffff', borderRadius: 18, padding: 18, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+          {sessionRole === 'admin' && !selectedIssue && <div style={{ background: '#ffffff', borderRadius: 18, padding: 18, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
               <h2 style={{ margin: 0 }}>Raw SurveyCTO Pulls</h2>
               <span style={{ color: '#6b7280', fontSize: 14 }}>{rawImports.length} items</span>
@@ -1047,12 +1151,12 @@ function App() {
                 ))}
               </div>
             )}
-          </div>
+          </div>}
 
           <div style={{ background: '#ffffff', borderRadius: 18, padding: 18, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
               <h2 style={{ margin: 0 }}>Review Queue</h2>
-              <span style={{ color: '#6b7280', fontSize: 14 }}>{issues.length} items</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>{sessionRole === 'admin' && <button onClick={runMainSurveyQC} style={{ padding: '7px 10px', borderRadius: 8, border: 'none', background: '#2563eb', color: '#fff', cursor: 'pointer', fontWeight: 700 }}>Run QC checks</button>}<span style={{ color: '#6b7280', fontSize: 14 }}>{issues.length} assigned items</span></div>
             </div>
 
             {issues.length === 0 ? (
@@ -1098,6 +1202,20 @@ function App() {
                   <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>Summary</div>
                   <div style={{ fontWeight: 700 }}>{selectedIssue.issue_summary}</div>
                 </div>
+                <div style={{ background: '#f8fafc', borderRadius: 12, padding: 14 }}>
+                  <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>Evidence</div>
+                  <div>{selectedIssue.evidence || 'No evidence was recorded.'}</div>
+                </div>
+                <div style={{ padding: 14, borderRadius: 12, background: '#eff6ff', color: '#1e3a5f', lineHeight: 1.55 }}>
+                  <strong>What to review</strong><div style={{ marginTop: 5 }}>Confirm the evidence against the submission, check whether this is a legitimate field condition, then assign a reviewer or record the resolution. This flag is <strong>{selectedIssue.severity}</strong> severity.</div>
+                </div>
+                <div style={{ display: 'grid', gap: 6 }}>
+                  <label htmlFor="issue-assignee" style={{ fontSize: 12, color: '#6b7280', fontWeight: 700 }}>Assign reviewer</label>
+                  <select id="issue-assignee" value={selectedIssue.assigned_to_user_id || ''} onChange={(event) => assignIssue(selectedIssue.issue_id, event.target.value)} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', background: '#fff' }}>
+                    <option value="">Unassigned</option>
+                    {staffMembers.map((member) => <option key={member.staff_id} value={member.staff_id}>{member.username} — {member.role}</option>)}
+                  </select>
+                </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
                   <div style={{ background: '#f8fafc', borderRadius: 12, padding: 12 }}>
                     <div style={{ fontSize: 12, color: '#6b7280' }}>Submission key</div>
@@ -1123,6 +1241,11 @@ function App() {
                 <div style={{ background: '#f8fafc', borderRadius: 12, padding: 12 }}>
                   <div style={{ fontSize: 12, color: '#6b7280' }}>Resolution note</div>
                   <div>{selectedIssue.resolution_note || 'No resolution note has been added yet.'}</div>
+                </div>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                  <button onClick={() => updateIssueStatus('in_progress')} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#dbeafe', color: '#155dc4', cursor: 'pointer', fontWeight: 800 }}>Start review</button>
+                  <button onClick={() => updateIssueStatus('resolved')} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#dcfce7', color: '#166534', cursor: 'pointer', fontWeight: 800 }}>Resolve with note</button>
+                  <button onClick={() => updateIssueStatus('rejected')} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#f1f5f9', color: '#475569', cursor: 'pointer', fontWeight: 800 }}>Mark not an issue</button>
                 </div>
               </div>
             ) : (

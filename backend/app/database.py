@@ -66,6 +66,22 @@ def _ensure_issue_queue_severity_column(engine) -> None:
                 connection.exec_driver_sql(
                     "ALTER TABLE qc.issue_queue ADD COLUMN IF NOT EXISTS severity text NOT NULL DEFAULT 'medium'"
                 )
+            rule_columns = {column["name"] for column in inspector.get_columns("rule_definition", schema="qc")}
+            # Older deployed schemas predate these fields, while the API and
+            # QC catalogue already require them.
+            if "name" not in rule_columns:
+                connection.exec_driver_sql("ALTER TABLE qc.rule_definition ADD COLUMN IF NOT EXISTS name text")
+                connection.exec_driver_sql("UPDATE qc.rule_definition SET name = rule_code WHERE name IS NULL")
+                connection.exec_driver_sql("ALTER TABLE qc.rule_definition ALTER COLUMN name SET NOT NULL")
+            if "operator" not in rule_columns:
+                connection.exec_driver_sql("ALTER TABLE qc.rule_definition ADD COLUMN IF NOT EXISTS operator text")
+            if "threshold" not in rule_columns:
+                connection.exec_driver_sql("ALTER TABLE qc.rule_definition ADD COLUMN IF NOT EXISTS threshold double precision")
+            staff_columns = {column["name"] for column in inspector.get_columns("staff_member", schema="app")}
+            if "password_hash" not in staff_columns:
+                connection.exec_driver_sql("ALTER TABLE app.staff_member ADD COLUMN IF NOT EXISTS password_hash text NOT NULL DEFAULT ''")
+            if "is_active" not in staff_columns:
+                connection.exec_driver_sql("ALTER TABLE app.staff_member ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true")
     except (IntegrityError, ProgrammingError) as exc:
         logging.warning("Unable to ensure qc.issue_queue.severity exists: %s", exc)
 
