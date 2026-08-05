@@ -165,6 +165,7 @@ class IssueQueue(Base):
     severity: Mapped[str] = Column(Text, nullable=False, default="medium")
     assigned_to_user_id: Mapped[str | None] = Column(String(36))
     assigned_to_role: Mapped[str | None] = Column(Text)
+    assignment_remark: Mapped[str | None] = Column(Text)
     issue_summary: Mapped[str] = Column(Text, nullable=False)
     resolution_note: Mapped[str | None] = Column(Text)
     created_at: Mapped[datetime] = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

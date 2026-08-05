@@ -92,6 +92,31 @@ from .schemas import (
     RawDataTableResponse,
 )
 
+# The Main Survey's City_1 field stores a city code even though its form label
+# says "REGION".  Decode it for reviewers and derive the Nigerian region.
+CITY_DETAILS = {
+    "1": ("Lagos", "South West"), "2": ("Ibadan", "South West"), "3": ("Abuja", "North Central"),
+    "4": ("Kano", "North West"), "5": ("Kaduna", "North West"), "6": ("PHC", "South South"),
+    "7": ("Benin", "South South"), "8": ("Onitsha", "South East"), "9": ("Enugu", "South East"),
+    "10": ("Owerri", "South East"), "11": ("Jos", "North Central"), "12": ("Uyo", "South South"),
+    "13": ("Ilorin", "North Central"), "14": ("Sokoto", "North West"), "15": ("Warri", "South South"),
+}
+
+
+def _city_and_region(city_value: str) -> tuple[str, str]:
+    normalized = str(city_value or "").strip()
+    code = normalized.removesuffix(".0")
+    return CITY_DETAILS.get(code, (normalized or "Not recorded", "Not recorded"))
+
+
+def _interviewer_display(interviewer_value: Any) -> str:
+    """Show the XLSForm roster name, retaining the source ID for audits."""
+    identifier = str(interviewer_value or "").strip()
+    if not identifier:
+        return "Not recorded"
+    name = str(_map_cell_value("Interviewer", identifier) or identifier).strip()
+    return f"{name} (ID {identifier.removesuffix('.0')})" if name != identifier else identifier
+
 SYNC_SCRIPT_PATH = Path(os.getenv("SYNC_SCRIPT_PATH", str(Path(__file__).resolve().parents[2] / "scripts" / "surveycto_duckdb_sync.py"))).resolve()
 SYNC_RESULT_PATH = Path(os.getenv("SYNC_RESULT_PATH", str(Path(__file__).resolve().parents[2] / "sync_result.json"))).resolve()
 EXPORT_DIR = Path(os.getenv("EXPORT_DIR", str(Path(__file__).resolve().parents[2] / "exports"))).resolve()
@@ -1395,7 +1420,7 @@ def evaluate_next_rule(db: Session = Depends(get_db)) -> QCResultResponse:
 
 @app.get("/api/qc/review-queue", response_model=ReviewQueueResponse)
 def get_review_queue(
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(10, ge=1, le=200),
     offset: int = Query(0, ge=0),
     assignee_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
@@ -1419,11 +1444,33 @@ def get_review_queue(
     staff_by_id = {member.staff_id: member.username for member in db.execute(select(StaffMember)).scalars().all()}
     results_by_id = {result.rule_result_id: result for result in db.execute(select(RuleResult)).scalars().all()}
     raw_by_key = {raw.submission_key: raw for raw in db.execute(select(RawSurveyCTOSubmission)).scalars().all()}
+
+    def value(payload: dict[str, Any], *names: str) -> str:
+        nested_answers = payload.get("answers")
+        source = nested_answers if isinstance(nested_answers, dict) else payload
+        lookup = {str(key).lower(): item for key, item in source.items()}
+        return str(next((lookup[name.lower()] for name in names if name.lower() in lookup), "") or "")
+
+    def issue_context(payload: dict[str, Any]) -> dict[str, str]:
+        first_name, surname = value(payload, "First_name", "first_name"), value(payload, "Surname", "surname")
+        respondent = " ".join(part for part in (first_name, surname) if part).strip()
+        city, region = _city_and_region(value(payload, "City_1", "City", "city"))
+        return {
+            "Interviewer": _interviewer_display(value(payload, "Interviewer", "username", "interviewer_id")),
+            "Respondent": respondent or "Not recorded",
+            "Phone": value(payload, "Mobile", "phone", "phone_number", "respondent_phone") or "Not recorded",
+            "City": city,
+            "Region": region,
+            "Start time": value(payload, "starttime", "start_time") or "Not recorded",
+            "End time": value(payload, "endtime", "end_time") or "Not recorded",
+            "Interview duration": value(payload, "duration") or "Not recorded",
+        }
+
     def serialize_issue(issue: IssueQueue) -> ReviewQueueItem:
         result = results_by_id.get(issue.rule_result_id) if issue.rule_result_id else None
         raw_submission = raw_by_key.get(issue.submission_key) if issue.submission_key else None
         raw_payload = raw_submission.raw_payload if raw_submission is not None else {}
-        interviewer = raw_payload.get("Interviewer") or raw_payload.get("username") or "Unknown"
+        context = issue_context(raw_payload) if isinstance(raw_payload, dict) else {}
         return ReviewQueueItem(
             issue_id=str(issue.issue_id), submission_key=issue.submission_key, case_id=issue.case_id,
             issue_status=issue.issue_status, status=issue.issue_status, issue_summary=issue.issue_summary,
@@ -1431,8 +1478,13 @@ def get_review_queue(
             updated_at=issue.updated_at, resolved_at=issue.resolved_at, resolution_note=issue.resolution_note,
             assigned_to_user_id=str(issue.assigned_to_user_id) if issue.assigned_to_user_id else None,
             assigned_to_name=staff_by_id.get(issue.assigned_to_user_id) if issue.assigned_to_user_id else None,
-            flag_name=result.rule_code if result else None, interviewer=str(interviewer),
+            assignment_remark=issue.assignment_remark,
+            # Use the same decoded value displayed in the report context.  Raw
+            # submissions may keep answers under an `answers` object, so direct
+            # top-level lookups can otherwise regress to the interviewer ID.
+            flag_name=result.rule_code if result else None, interviewer=context.get("Interviewer", "Not recorded"),
             evidence=result.result_message if result else issue.issue_summary,
+            context=context,
         )
 
     return ReviewQueueResponse(issues=[serialize_issue(issue) for issue in issues], count=total_count)
@@ -1628,6 +1680,7 @@ def _analysis_tables_for_category(
     question_id: str | None = None,
     response_filter_question: str | None = None,
     response_filter_value: str | None = None,
+    clean_only: bool = False,
 ) -> tuple[int, list[dict[str, Any]], list[dict[str, str]], str | None, list[dict[str, str]], str | None]:
     metadata_path = Path(__file__).resolve().parents[1] / "data" / "xlsform_metadata.json"
     if QUESTIONNAIRE_WORKBOOK_PATH.exists():
@@ -1636,7 +1689,14 @@ def _analysis_tables_for_category(
         metadata = load_metadata(metadata_path)
     else:
         raise HTTPException(status_code=503, detail="Questionnaire decoding source is not available")
-    payloads = db.execute(select(RawSurveyCTOSubmission.raw_payload)).scalars().all()
+    raw_rows = db.execute(select(RawSurveyCTOSubmission.submission_key, RawSurveyCTOSubmission.raw_payload)).all()
+    if clean_only:
+        active_outlier_keys = set(db.execute(select(IssueQueue.submission_key).where(
+            IssueQueue.submission_key.is_not(None),
+            IssueQueue.issue_status.notin_(("resolved", "rejected")),
+        )).scalars().all())
+        raw_rows = [row for row in raw_rows if row.submission_key not in active_outlier_keys]
+    payloads = [row.raw_payload for row in raw_rows]
     # Optionally filter payloads to those where a given question contains a specific response label
     if response_filter_question and response_filter_value:
         filtered = []
@@ -1728,15 +1788,40 @@ def run_main_survey_qc(db: Session = Depends(get_db)) -> dict[str, int]:
     if flag_codes - defined_codes:
         db.flush()
     submissions_by_key = {row.submission_key: row for row in submissions}
-    existing_results = set(db.execute(select(RuleResult.rule_code, RuleResult.submission_key)).all())
+    existing_results = {
+        (result.rule_code, result.submission_key, result.field_name or "default"): result
+        for result in db.execute(select(RuleResult).where(RuleResult.rule_code.in_(flag_codes))).scalars().all()
+    }
+    existing_issues = {
+        issue.rule_result_id: issue
+        for issue in db.execute(select(IssueQueue).where(IssueQueue.rule_result_id.in_([result.rule_result_id for result in existing_results.values()]))).scalars().all()
+    } if existing_results else {}
     created = 0
     for flag in flags:
-        if (flag["code"], flag["submission_key"]) in existing_results:
-            continue
         raw = submissions_by_key.get(flag["submission_key"])
-        result = RuleResult(rule_code=flag["code"], instrument_code=raw.instrument_code if raw else "main", submission_key=flag["submission_key"], table_name="raw.surveycto_submission", severity=flag["severity"], result_status="open", result_message=flag["message"])
+        payload = raw.raw_payload if raw and isinstance(raw.raw_payload, dict) else {}
+        nested_answers = payload.get("answers")
+        answer_source = nested_answers if isinstance(nested_answers, dict) else payload
+        interviewer_id = str(answer_source.get("Interviewer") or answer_source.get("username") or "").strip()
+        interviewer_name = _interviewer_display(interviewer_id)
+        message, action = flag["message"], flag["action"]
+        if interviewer_id and interviewer_name != interviewer_id:
+            message = re.sub(rf"\binterviewer {re.escape(interviewer_id)}\b", f"interviewer {interviewer_name}", message, flags=re.IGNORECASE)
+            action = re.sub(rf"\binterviewer {re.escape(interviewer_id)}\b", f"interviewer {interviewer_name}", action, flags=re.IGNORECASE)
+        evidence = f"{message}\n\nNext check: {action}"
+        finding_key = flag.get("finding_key", "default")
+        existing = existing_results.get((flag["code"], flag["submission_key"], finding_key))
+        if existing:
+            # Refresh previously created findings too, so reviewers immediately
+            # benefit from improved explanations after a QC rerun.
+            existing.result_message = evidence
+            issue = existing_issues.get(existing.rule_result_id)
+            if issue:
+                issue.issue_summary = flag["summary"]
+            continue
+        result = RuleResult(rule_code=flag["code"], instrument_code=raw.instrument_code if raw else "main", submission_key=flag["submission_key"], table_name="raw.surveycto_submission", field_name=finding_key, severity=flag["severity"], result_status="open", result_message=evidence)
         db.add(result); db.flush()
-        db.add(IssueQueue(rule_result_id=result.rule_result_id, instrument_code=result.instrument_code, submission_key=result.submission_key, issue_status="pending_review", severity=result.severity, issue_summary=f"{flag['code']}: {flag['message']}"))
+        db.add(IssueQueue(rule_result_id=result.rule_result_id, instrument_code=result.instrument_code, submission_key=result.submission_key, issue_status="pending_review", severity=result.severity, issue_summary=flag["summary"]))
         created += 1
     db.commit()
     return {"evaluated": len(submissions), "flags_found": len(flags), "issues_created": created}
@@ -1752,9 +1837,10 @@ def assign_issue(issue_id: str, payload: IssueAssignmentRequest, db: Session = D
         raise HTTPException(status_code=404, detail="Staff member not found")
     issue.assigned_to_user_id = assignee.staff_id if assignee else None
     issue.assigned_to_role = assignee.role if assignee else None
+    issue.assignment_remark = payload.assignment_remark.strip() if payload.assignment_remark and payload.assignment_remark.strip() else None
     issue.updated_at = datetime.now(timezone.utc)
     db.commit(); db.refresh(issue)
-    return ReviewQueueItem(issue_id=str(issue.issue_id), submission_key=issue.submission_key, case_id=issue.case_id, issue_status=issue.issue_status, status=issue.issue_status, issue_summary=issue.issue_summary, severity=issue.severity, created_at=issue.created_at, updated_at=issue.updated_at, resolved_at=issue.resolved_at, resolution_note=issue.resolution_note, assigned_to_user_id=str(issue.assigned_to_user_id) if issue.assigned_to_user_id else None, assigned_to_name=assignee.username if assignee else None)
+    return ReviewQueueItem(issue_id=str(issue.issue_id), submission_key=issue.submission_key, case_id=issue.case_id, issue_status=issue.issue_status, status=issue.issue_status, issue_summary=issue.issue_summary, severity=issue.severity, created_at=issue.created_at, updated_at=issue.updated_at, resolved_at=issue.resolved_at, resolution_note=issue.resolution_note, assigned_to_user_id=str(issue.assigned_to_user_id) if issue.assigned_to_user_id else None, assigned_to_name=assignee.username if assignee else None, assignment_remark=issue.assignment_remark)
 
 
 def _refresh_analysis_workbook(db: Session, category: str = "noodles") -> None:
@@ -1905,6 +1991,20 @@ def export_raw_data_table(
 @app.get("/api/admin/dashboard", response_model=AdminDashboardResponse)
 def get_admin_dashboard(db: Session = Depends(get_db)) -> AdminDashboardResponse:
     raw_count = db.execute(select(func.count()).select_from(RawSurveyCTOSubmission)).scalar_one()
+    # A survey is an outlier while it has at least one finding that has not
+    # been cleared. Count submission keys, rather than findings, so the three
+    # survey metrics always reconcile: pulled = good + outliers.
+    total_survey_count = db.execute(
+        select(func.count(func.distinct(RawSurveyCTOSubmission.submission_key)))
+    ).scalar_one()
+    active_outlier_keys = select(IssueQueue.submission_key).where(
+        IssueQueue.submission_key.is_not(None),
+        IssueQueue.issue_status.notin_(("resolved", "rejected")),
+    ).distinct().subquery()
+    outlier_survey_count = db.execute(
+        select(func.count()).select_from(active_outlier_keys)
+    ).scalar_one()
+    good_survey_count = max(0, total_survey_count - outlier_survey_count)
     issue_count = db.execute(select(func.count()).select_from(IssueQueue)).scalar_one()
     pending_review_count = db.execute(
         select(func.count()).select_from(IssueQueue).where(IssueQueue.issue_status == "pending_review")
@@ -1919,6 +2019,9 @@ def get_admin_dashboard(db: Session = Depends(get_db)) -> AdminDashboardResponse
     last_sync_at = db.execute(select(func.max(RawSurveyCTOSubmission.fetched_at))).scalar_one()
 
     return AdminDashboardResponse(
+        total_survey_count=total_survey_count,
+        good_survey_count=good_survey_count,
+        outlier_survey_count=outlier_survey_count,
         raw_submission_count=raw_count,
         issue_count=issue_count,
         pending_review_count=pending_review_count,
@@ -1927,6 +2030,89 @@ def get_admin_dashboard(db: Session = Depends(get_db)) -> AdminDashboardResponse
         staff_count=staff_count,
         last_sync_at=last_sync_at,
     )
+
+
+@app.get("/api/analytics/clean-tables", response_model=AnalysisTablesResponse)
+def get_clean_analysis_tables(
+    category: str = Query("noodles"),
+    filter_field: str | None = Query(default=None),
+    question_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> AnalysisTablesResponse:
+    """Analysis restricted to submissions with no active QC finding."""
+    respondent_count, tables, filters, selected_filter, questions, selected_question = _analysis_tables_for_category(
+        db, category, filter_field, question_id, clean_only=True
+    )
+    return AnalysisTablesResponse(
+        category=category.title(), respondent_count=respondent_count,
+        tables=[AnalysisTableResponse.model_validate(table) for table in tables],
+        filters=[AnalysisFilterField(field=item["field"], label=item["label"]) for item in filters],
+        filter_field=selected_filter,
+        questions=[AnalysisQuestion(id=item["id"], label=item["label"]) for item in questions],
+        question_id=selected_question,
+    )
+
+
+@app.get("/api/qc/quality-overview")
+def get_quality_overview(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Score saved submissions by the people and field segments behind them.
+
+    Scores are deliberately explainable and normalised for workload: the
+    share of interviews with high/medium findings determines the deduction.
+    They are prioritisation signals, never a verdict on a person or location.
+    """
+    submissions = db.execute(select(RawSurveyCTOSubmission)).scalars().all()
+    issues_by_submission: dict[str, list[IssueQueue]] = {}
+    for issue in db.execute(select(IssueQueue)).scalars().all():
+        if issue.submission_key:
+            issues_by_submission.setdefault(issue.submission_key, []).append(issue)
+
+    def field(payload: dict[str, Any], *names: str) -> str:
+        nested_answers = payload.get("answers")
+        source = nested_answers if isinstance(nested_answers, dict) else payload
+        lookup = {str(key).lower(): value for key, value in source.items()}
+        return str(next((lookup[name.lower()] for name in names if name.lower() in lookup), "") or "").strip()
+
+    groups: dict[str, dict[str, dict[str, Any]]] = {"interviewers": {}, "respondents": {}, "cities": {}, "regions": {}}
+
+    def add(group: str, name: str, case_issues: list[IssueQueue]) -> None:
+        if not name:
+            return
+        entry = groups[group].setdefault(name, {"name": name, "interviews": 0, "flagged_interviews": 0, "high_flagged_interviews": 0, "medium_flagged_interviews": 0, "high_flags": 0, "medium_flags": 0})
+        entry["interviews"] += 1
+        if case_issues:
+            entry["flagged_interviews"] += 1
+        if any(issue.severity.lower() == "high" for issue in case_issues):
+            entry["high_flagged_interviews"] += 1
+        if any(issue.severity.lower() == "medium" for issue in case_issues):
+            entry["medium_flagged_interviews"] += 1
+        entry["high_flags"] += sum(1 for issue in case_issues if issue.severity.lower() == "high")
+        entry["medium_flags"] += sum(1 for issue in case_issues if issue.severity.lower() == "medium")
+
+    for submission in submissions:
+        payload = submission.raw_payload if isinstance(submission.raw_payload, dict) else {}
+        case_issues = issues_by_submission.get(submission.submission_key, [])
+        first_name, surname = field(payload, "First_name", "first_name"), field(payload, "Surname", "surname")
+        respondent = " ".join(part for part in (first_name, surname) if part) or field(payload, "Mobile", "phone", "phone_number")
+        add("interviewers", _interviewer_display(field(payload, "Interviewer", "username", "interviewer_id")), case_issues)
+        add("respondents", respondent or "Not recorded", case_issues)
+        city, region = _city_and_region(field(payload, "City_1", "City", "city"))
+        add("cities", city, case_issues)
+        add("regions", region, case_issues)
+
+    def finish(entries: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        finished = []
+        for entry in entries.values():
+            high_rate = entry["high_flagged_interviews"] / entry["interviews"] if entry["interviews"] else 0
+            medium_rate = entry["medium_flagged_interviews"] / entry["interviews"] if entry["interviews"] else 0
+            score = max(20, round(100 - high_rate * 55 - medium_rate * 25))
+            entry["quality_score"] = score
+            entry["quality_band"] = "Strong" if score >= 90 else "Watch" if score >= 75 else "Review"
+            entry["flag_rate"] = round(entry["flagged_interviews"] / entry["interviews"] * 100, 1) if entry["interviews"] else 0
+            finished.append(entry)
+        return sorted(finished, key=lambda item: (item["quality_score"], -item["interviews"], item["name"]))
+
+    return {"scoring_note": "Quality score is workload-normalised: the share of interviews with a high finding can deduct up to 55 points; the share with a medium finding can deduct up to 25 (minimum 20). Use it to prioritise review, not as an automatic judgement.", "entities": {name: finish(entries) for name, entries in groups.items()}}
 
 
 @app.get("/api/admin/surveycto-status", response_model=SurveyCTOStatusResponse)
@@ -2007,4 +2193,5 @@ def update_issue_action(issue_id: str, payload: IssueActionRequest, db: Session 
         updated_at=issue.updated_at,
         resolved_at=issue.resolved_at,
         resolution_note=issue.resolution_note,
+        assignment_remark=issue.assignment_remark,
     )

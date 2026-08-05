@@ -4,7 +4,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.exc import IntegrityError, NoSuchTableError, ProgrammingError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
@@ -54,18 +54,21 @@ def get_db():
         db.close()
 
 
-def _ensure_issue_queue_severity_column(engine) -> None:
-    if engine.dialect.name != "postgresql":
-        return
-
+def _ensure_issue_queue_columns(engine) -> None:
     try:
         with engine.begin() as connection:
             inspector = inspect(connection)
-            existing_columns = {column["name"] for column in inspector.get_columns("issue_queue", schema="qc")}
+            schema = "qc" if engine.dialect.name == "postgresql" else None
+            table = "qc.issue_queue" if schema else "issue_queue"
+            existing_columns = {column["name"] for column in inspector.get_columns("issue_queue", schema=schema)}
             if "severity" not in existing_columns:
                 connection.exec_driver_sql(
-                    "ALTER TABLE qc.issue_queue ADD COLUMN IF NOT EXISTS severity text NOT NULL DEFAULT 'medium'"
+                    f"ALTER TABLE {table} ADD COLUMN severity text NOT NULL DEFAULT 'medium'"
                 )
+            if "assignment_remark" not in existing_columns:
+                connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN assignment_remark text")
+            if engine.dialect.name != "postgresql":
+                return
             rule_columns = {column["name"] for column in inspector.get_columns("rule_definition", schema="qc")}
             # Older deployed schemas predate these fields, while the API and
             # QC catalogue already require them.
@@ -82,28 +85,26 @@ def _ensure_issue_queue_severity_column(engine) -> None:
                 connection.exec_driver_sql("ALTER TABLE app.staff_member ADD COLUMN IF NOT EXISTS password_hash text NOT NULL DEFAULT ''")
             if "is_active" not in staff_columns:
                 connection.exec_driver_sql("ALTER TABLE app.staff_member ADD COLUMN IF NOT EXISTS is_active boolean NOT NULL DEFAULT true")
-    except (IntegrityError, ProgrammingError) as exc:
-        logging.warning("Unable to ensure qc.issue_queue.severity exists: %s", exc)
+    except (IntegrityError, NoSuchTableError, ProgrammingError) as exc:
+        logging.warning("Unable to ensure issue queue columns exist: %s", exc)
 
 
 def create_schemas():
     engine = get_engine()
-    if engine.dialect.name != "postgresql":
-        return
-
     if os.getenv("SKIP_SCHEMA_CREATION", "false").strip().lower() in ("1", "true", "yes", "y"):
         return
 
-    try:
-        with engine.begin() as connection:
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS raw")
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS clean")
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS qc")
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS app")
-            connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS audit")
-    except (IntegrityError, ProgrammingError):
-        # Limited privilege users may not be allowed to create schemas,
-        # and multiple workers may race to create the same schema.
-        pass
+    if engine.dialect.name == "postgresql":
+        try:
+            with engine.begin() as connection:
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS raw")
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS clean")
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS qc")
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS app")
+                connection.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS audit")
+        except (IntegrityError, ProgrammingError):
+            # Limited privilege users may not be allowed to create schemas,
+            # and multiple workers may race to create the same schema.
+            pass
 
-    _ensure_issue_queue_severity_column(engine)
+    _ensure_issue_queue_columns(engine)

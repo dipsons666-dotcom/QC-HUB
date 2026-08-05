@@ -82,9 +82,11 @@ class ReviewQueueItem(BaseModel):
     resolution_note: str | None = None
     assigned_to_user_id: str | None = None
     assigned_to_name: str | None = None
+    assignment_remark: str | None = None
     flag_name: str | None = None
     interviewer: str | None = None
     evidence: str | None = None
+    context: dict[str, str] = Field(default_factory=dict)
 
 
 class ReviewQueueResponse(BaseModel):
@@ -99,6 +101,7 @@ class IssueActionRequest(BaseModel):
 
 class IssueAssignmentRequest(BaseModel):
     staff_id: str | None = None
+    assignment_remark: str | None = Field(default=None, max_length=1000)
 
 
 class RawSurveyCTOItem(BaseModel):
@@ -214,6 +217,9 @@ class LoginResponse(BaseModel):
 
 
 class AdminDashboardResponse(BaseModel):
+    total_survey_count: int
+    good_survey_count: int
+    outlier_survey_count: int
     raw_submission_count: int
     issue_count: int
     pending_review_count: int

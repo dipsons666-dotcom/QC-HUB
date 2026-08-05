@@ -2,6 +2,14 @@ import { useEffect, useMemo, useState } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 
+const splitQCReport = (evidence = '') => {
+  const marker = '\n\nNext check: ';
+  const index = evidence.indexOf(marker);
+  return index === -1
+    ? { evidence, nextCheck: '' }
+    : { evidence: evidence.slice(0, index), nextCheck: evidence.slice(index + marker.length) };
+};
+
 const workflowSteps = [
   { title: 'Import', description: 'Pull SurveyCTO submissions into the QC Hub raw ingestion layer.' },
   { title: 'Process', description: 'Normalize and stage imported records for downstream review.' },
@@ -11,10 +19,14 @@ const workflowSteps = [
 
 function App() {
   const [issues, setIssues] = useState([]);
+  const [reviewQueueCount, setReviewQueueCount] = useState(0);
+  const [reviewQueueLoading, setReviewQueueLoading] = useState(false);
+  const [reviewQueueOffset, setReviewQueueOffset] = useState(0);
   const [selectedIssue, setSelectedIssue] = useState(null);
   const [rawImports, setRawImports] = useState([]);
   const [rawSubmissionCount, setRawSubmissionCount] = useState(0);
   const [page, setPage] = useState('home');
+  const [adminSidebarOpen, setAdminSidebarOpen] = useState(false);
   const [sessionRole, setSessionRole] = useState('');
   const [sessionUserId, setSessionUserId] = useState('');
   const [loginName, setLoginName] = useState('');
@@ -23,6 +35,8 @@ function App() {
   const [showRawBrowser, setShowRawBrowser] = useState(false);
   const [syncStatus, setSyncStatus] = useState('');
   const [dashboard, setDashboard] = useState(null);
+  const [qualityOverview, setQualityOverview] = useState({ entities: {}, scoring_note: '' });
+  const [qualityGroup, setQualityGroup] = useState('interviewers');
   const [staffMembers, setStaffMembers] = useState([]);
   const [rawDataTable, setRawDataTable] = useState({ columns: [], rows: [] });
   const [rawDataOffset, setRawDataOffset] = useState(0);
@@ -51,6 +65,8 @@ function App() {
   const [insights, setInsights] = useState({ respondent_count: 0, categories: [], sectors: [] });
   const [insightsLoading, setInsightsLoading] = useState(false);
   const [analysisTables, setAnalysisTables] = useState({ respondent_count: 0, tables: [], filters: [], filter_field: null, questions: [], question_id: null });
+  const [cleanAnalysisTables, setCleanAnalysisTables] = useState({ respondent_count: 0, tables: [], questions: [], question_id: null });
+  const [cleanAnalysisQuestionId, setCleanAnalysisQuestionId] = useState('');
   const [selectedAnalysisTableId, setSelectedAnalysisTableId] = useState('');
   const [selectedAnalysisCut, setSelectedAnalysisCut] = useState('Total');
   const [selectedAnalysisGroupLabels, setSelectedAnalysisGroupLabels] = useState([]);
@@ -62,18 +78,7 @@ function App() {
       .then((data) => setDashboard(data))
       .catch(() => setDashboard(null));
 
-    const queueQuery = sessionRole === 'admin' ? 'limit=20' : `limit=20&assignee_id=${encodeURIComponent(sessionUserId)}`;
-    fetch(`${API_BASE}/api/qc/review-queue?${queueQuery}`)
-      .then((response) => response.json())
-      .then((data) => {
-        const loadedIssues = data.issues || [];
-        setIssues(loadedIssues);
-        setSelectedIssue(null);
-      })
-      .catch(() => {
-        setIssues([]);
-        setSelectedIssue(null);
-      });
+    loadReviewQueue();
 
     fetch(`${API_BASE}/api/import/survey-platform/raw?limit=20&include_payload=false`)
       .then((response) => response.json())
@@ -86,6 +91,47 @@ function App() {
         setRawImports([]);
         setRawSubmissionCount(0);
       });
+  };
+
+  const loadReviewQueue = (offset = 0) => {
+    setReviewQueueLoading(true);
+    const params = new URLSearchParams({ limit: '10', offset: String(offset) });
+    if (sessionRole !== 'admin') params.set('assignee_id', sessionUserId);
+    fetch(`${API_BASE}/api/qc/review-queue?${params.toString()}`)
+      .then((response) => response.json())
+      .then((data) => {
+        const loadedIssues = data.issues || [];
+        setIssues(loadedIssues);
+        setReviewQueueCount(Number(data.count || 0));
+        setReviewQueueOffset(offset);
+        setSelectedIssue(null);
+      })
+      .catch(() => {
+        setIssues([]);
+        setReviewQueueCount(0);
+        setReviewQueueOffset(0);
+        setSelectedIssue(null);
+      })
+      .finally(() => setReviewQueueLoading(false));
+  };
+
+  const loadQualityOverview = () => {
+    fetch(`${API_BASE}/api/qc/quality-overview`)
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((data) => setQualityOverview(data))
+      .catch(() => setQualityOverview({ entities: {}, scoring_note: '' }));
+  };
+
+  const loadCleanAnalysis = (questionId = '') => {
+    const params = new URLSearchParams({ category: 'noodles' });
+    if (questionId) params.set('question_id', questionId);
+    fetch(`${API_BASE}/api/analytics/clean-tables?${params.toString()}`)
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((data) => {
+        setCleanAnalysisTables(data);
+        setCleanAnalysisQuestionId(data.question_id || data.tables?.[0]?.id || '');
+      })
+      .catch(() => setCleanAnalysisTables({ respondent_count: 0, tables: [], questions: [], question_id: null }));
   };
 
   const loadRawDataPage = (offset = 0, append = false, search = rawDataSearch, pageSize = rawDataPageSize) => {
@@ -157,10 +203,25 @@ function App() {
   }, [sessionRole, sessionUserId]);
 
   useEffect(() => {
-    if (page === 'admin' || page === 'raw') {
+    if (page === 'admin' || page === 'raw' || page === 'staff') {
       loadAdminData();
     }
   }, [page, showRawBrowser]);
+
+  useEffect(() => {
+    if (page !== 'admin') return undefined;
+
+    // Imports can finish in the background, so keep the administrator's
+    // survey-quality totals current even when no button has been clicked.
+    const refreshDashboard = () => {
+      fetch(`${API_BASE}/api/admin/dashboard`)
+        .then((response) => response.ok ? response.json() : Promise.reject())
+        .then((data) => setDashboard(data))
+        .catch(() => {});
+    };
+    const intervalId = setInterval(refreshDashboard, 15000);
+    return () => clearInterval(intervalId);
+  }, [page]);
 
   useEffect(() => {
     if (page === 'decoded') {
@@ -170,6 +231,14 @@ function App() {
 
   useEffect(() => {
     if (page === 'insights') loadInsights();
+  }, [page]);
+
+  useEffect(() => {
+    if (page === 'quality') loadQualityOverview();
+  }, [page]);
+
+  useEffect(() => {
+    if (page === 'clean-analysis') loadCleanAnalysis();
   }, [page]);
 
   useEffect(() => {
@@ -244,11 +313,11 @@ function App() {
       });
   };
 
-  const assignIssue = (issueId, staffId) => {
+  const assignIssue = (issueId, staffId, assignmentRemark = '') => {
     fetch(`${API_BASE}/api/qc/issues/${issueId}/assignment`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ staff_id: staffId || null }),
+      body: JSON.stringify({ staff_id: staffId || null, assignment_remark: assignmentRemark || null }),
     })
       .then((response) => response.ok ? response.json() : Promise.reject())
       .then((updated) => {
@@ -553,7 +622,17 @@ function App() {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
             <div style={{ fontWeight: 800, color: '#163c70', marginRight: 8 }}>QC Hub</div>
-            <button
+            {sessionRole !== 'admin' && <button
+              onClick={() => setPage('quality')}
+              style={{
+                padding: '12px 18px', marginRight: 10, borderRadius: 12,
+                border: page === 'quality' ? '2px solid #2563eb' : '1px solid #d1d5db',
+                background: page === 'quality' ? '#eff6ff' : '#ffffff', cursor: 'pointer', fontWeight: 700,
+              }}
+            >
+              Quality overview
+            </button>}
+            {sessionRole !== 'admin' && <button
               onClick={() => setPage('insights')}
               style={{
                 padding: '12px 18px',
@@ -566,8 +645,8 @@ function App() {
               }}
             >
               Insights
-            </button>
-            <button
+            </button>}
+            {sessionRole !== 'admin' && <button
               onClick={() => setPage('home')}
               style={{
                 padding: '12px 18px',
@@ -580,7 +659,7 @@ function App() {
               }}
             >
               Review workspace
-            </button>
+            </button>}
             {sessionRole === 'admin' && <button
               onClick={() => setPage('admin')}
               style={{
@@ -592,26 +671,7 @@ function App() {
                 fontWeight: 700,
               }}
             >
-              Admin Portal
-            </button>}
-            {sessionRole === 'admin' && <button
-              onClick={() => setPage('raw')}
-              style={{ padding: '12px 18px', borderRadius: 12, border: page === 'raw' ? '2px solid #2563eb' : '1px solid #d1d5db', background: page === 'raw' ? '#eff6ff' : '#ffffff', cursor: 'pointer', fontWeight: 700 }}
-            >
-              Raw data
-            </button>}
-            {sessionRole === 'admin' && <button
-              onClick={() => setPage('decoded')}
-              style={{
-                padding: '12px 18px',
-                borderRadius: 12,
-                border: page === 'decoded' ? '2px solid #2563eb' : '1px solid #d1d5db',
-                background: page === 'decoded' ? '#eff6ff' : '#ffffff',
-                cursor: 'pointer',
-                fontWeight: 700,
-              }}
-            >
-              Decoded Questions
+              Admin Dashboard
             </button>}
           </div>
           {sessionRole === 'admin' && <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
@@ -632,7 +692,34 @@ function App() {
           {sessionRole !== 'admin' && <button onClick={() => { setSessionRole(''); setSessionUserId(''); setLoginName(''); }} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', background: '#fff', color: '#334155', cursor: 'pointer', fontWeight: 700 }}>Sign out</button>}
         </div>
 
-        {page === 'insights' ? (
+        {sessionRole === 'admin' && <aside
+          onMouseEnter={() => setAdminSidebarOpen(true)}
+          onMouseLeave={() => setAdminSidebarOpen(false)}
+          style={{ position: 'fixed', zIndex: 20, top: 92, left: 0, width: adminSidebarOpen ? 230 : 54, overflow: 'hidden', borderRadius: '0 14px 14px 0', background: '#0f2a57', boxShadow: '0 8px 24px rgba(15, 42, 87, .25)', transition: 'width .18s ease' }}
+        >
+          <div style={{ padding: '14px 17px', color: '#bfdbfe', fontSize: 20, fontWeight: 800 }}>☰</div>
+          {[['home', 'Review workspace'], ['quality', 'Quality overview'], ['insights', 'Insights'], ['clean-analysis', 'Clean data analysis'], ['staff', 'Staff registration']].map(([target, label]) => <button key={target} onClick={() => setPage(target)} title={label} style={{ display: 'block', width: '100%', padding: '12px 17px', border: 0, borderLeft: page === target ? '3px solid #93c5fd' : '3px solid transparent', background: page === target ? '#1d4ed8' : 'transparent', color: '#fff', cursor: 'pointer', fontWeight: 700, whiteSpace: 'nowrap', textAlign: 'left' }}>{adminSidebarOpen ? label : label.charAt(0)}</button>)}
+        </aside>}
+
+        {page === 'clean-analysis' ? (
+          <section style={{ display: 'grid', gridTemplateColumns: '260px minmax(0, 1fr)', gap: 18, marginBottom: 24 }}>
+            <div style={{ background: '#fff', borderRadius: 16, padding: 16, boxShadow: '0 8px 28px rgba(15, 23, 42, .06)' }}><div style={{ color: '#15803d', fontSize: 12, fontWeight: 800, letterSpacing: '.1em' }}>QC-CLEARED DATA</div><h2 style={{ margin: '8px 0' }}>{cleanAnalysisTables.respondent_count.toLocaleString()} eligible submissions</h2><p style={{ color: '#64748b', fontSize: 13 }}>Only records with no active red flags are included. Resolved or cleared outliers enter automatically.</p><div style={{ display: 'grid', gap: 6 }}>{(cleanAnalysisTables.questions || []).map((question) => <button key={question.id} onClick={() => loadCleanAnalysis(question.id)} style={{ padding: '9px 10px', border: 0, borderRadius: 8, textAlign: 'left', cursor: 'pointer', background: question.id === cleanAnalysisQuestionId ? '#dcfce7' : 'transparent', fontWeight: question.id === cleanAnalysisQuestionId ? 700 : 500 }}>{question.label}</button>)}</div></div>
+            <div style={{ background: '#fff', borderRadius: 16, padding: 20, boxShadow: '0 8px 28px rgba(15, 23, 42, .06)' }}>{(() => { const table = cleanAnalysisTables.tables?.find((item) => item.id === cleanAnalysisQuestionId) || cleanAnalysisTables.tables?.[0]; return <><div style={{ color: '#15803d', fontSize: 12, fontWeight: 800, letterSpacing: '.1em' }}>CLEAN DATA ANALYSIS</div><h1 style={{ margin: '6px 0 16px' }}>{table?.title || 'Select a question'}</h1>{table ? <table style={{ width: '100%', borderCollapse: 'collapse' }}><thead><tr style={{ textAlign: 'left', background: '#f0fdf4' }}><th style={{ padding: 11 }}>Response</th><th style={{ padding: 11, textAlign: 'right' }}>N</th><th style={{ padding: 11, textAlign: 'right' }}>%</th></tr></thead><tbody>{table.rows.map((row) => <tr key={row.label} style={{ borderTop: '1px solid #e5e7eb' }}><td style={{ padding: 11 }}>{row.label}</td><td style={{ padding: 11, textAlign: 'right' }}>{row.count.toLocaleString()}</td><td style={{ padding: 11, textAlign: 'right' }}>{row.pct}%</td></tr>)}</tbody></table> : <p style={{ color: '#64748b' }}>No QC-cleared data is available yet.</p>}</>; })()}</div>
+          </section>
+        ) : page === 'staff' ? (
+          <section style={{ maxWidth: 680, background: '#fff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, .06)', marginBottom: 24 }}><div style={{ color: '#2563eb', fontSize: 12, letterSpacing: '.12em', fontWeight: 800 }}>ADMIN ONLY</div><h1 style={{ margin: '6px 0 18px' }}>Staff registration</h1><form onSubmit={handleCreateStaff} style={{ display: 'grid', gap: 14 }}><input required value={newStaff.username} onChange={(e) => setNewStaff({ ...newStaff, username: e.target.value })} placeholder="Name" style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }} /><input required value={newStaff.email} onChange={(e) => setNewStaff({ ...newStaff, email: e.target.value })} placeholder="Email" type="email" style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }} /><input required value={newStaff.password} onChange={(e) => setNewStaff({ ...newStaff, password: e.target.value })} placeholder="Temporary password (minimum 6 characters)" type="password" minLength={6} style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }} /><select value={newStaff.role} onChange={(e) => setNewStaff({ ...newStaff, role: e.target.value })} style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }}><option value="reviewer">Reviewer</option><option value="admin">Admin</option></select><button style={{ padding: '12px 16px', borderRadius: 12, border: 0, background: '#10b981', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>Register staff</button>{adminError && <div style={{ color: '#b91c1c' }}>{adminError}</div>}</form></section>
+        ) : page === 'quality' ? (
+          <section style={{ display: 'grid', gap: 16, marginBottom: 24 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', gap: 12, flexWrap: 'wrap' }}>
+              <div><div style={{ color: '#0875b8', fontWeight: 800, fontSize: 13, letterSpacing: '0.14em', textTransform: 'uppercase' }}>Saved QC signals</div><h1 style={{ margin: '6px 0 0', fontSize: 30 }}>Data quality by fieldwork segment</h1><p style={{ margin: '6px 0 0', color: '#64748b', maxWidth: 760 }}>{qualityOverview.scoring_note}</p></div>
+              <button onClick={loadQualityOverview} style={{ padding: '10px 14px', border: 'none', borderRadius: 10, background: '#216ee8', color: '#fff', cursor: 'pointer', fontWeight: 700 }}>Refresh scores</button>
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>{[['interviewers', 'Interviewers'], ['respondents', 'Respondents'], ['cities', 'Cities'], ['regions', 'Regions']].map(([key, label]) => <button key={key} onClick={() => setQualityGroup(key)} style={{ padding: '9px 12px', borderRadius: 9, border: qualityGroup === key ? '2px solid #2563eb' : '1px solid #cbd5e1', background: qualityGroup === key ? '#eff6ff' : '#fff', cursor: 'pointer', fontWeight: 700 }}>{label}</button>)}</div>
+            <div style={{ overflowX: 'auto', background: '#fff', borderRadius: 16, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 760 }}><thead><tr style={{ background: '#f8fafc', textAlign: 'left', color: '#475569' }}><th style={{ padding: 13 }}>Name / segment</th><th style={{ padding: 13, textAlign: 'right' }}>Interviews</th><th style={{ padding: 13, textAlign: 'right' }}>Flagged</th><th style={{ padding: 13, textAlign: 'right' }}>High flags</th><th style={{ padding: 13, textAlign: 'right' }}>Flag rate</th><th style={{ padding: 13, textAlign: 'right' }}>Quality</th><th style={{ padding: 13 }}>Priority</th></tr></thead><tbody>{(qualityOverview.entities?.[qualityGroup] || []).map((item) => <tr key={item.name} style={{ borderTop: '1px solid #e2e8f0' }}><td style={{ padding: 13, fontWeight: 700 }}>{item.name}</td><td style={{ padding: 13, textAlign: 'right' }}>{item.interviews}</td><td style={{ padding: 13, textAlign: 'right' }}>{item.flagged_interviews}</td><td style={{ padding: 13, textAlign: 'right' }}>{item.high_flags}</td><td style={{ padding: 13, textAlign: 'right' }}>{item.flag_rate}%</td><td style={{ padding: 13, textAlign: 'right', fontWeight: 800, color: item.quality_score < 75 ? '#b91c1c' : item.quality_score < 90 ? '#b45309' : '#15803d' }}>{item.quality_score}/100</td><td style={{ padding: 13 }}>{item.quality_band}</td></tr>)}{!(qualityOverview.entities?.[qualityGroup] || []).length && <tr><td colSpan="7" style={{ padding: 22, color: '#64748b', textAlign: 'center' }}>No saved submissions are available yet.</td></tr>}</tbody></table>
+            </div>
+          </section>
+        ) : page === 'insights' ? (
           <section style={{ display: 'grid', gap: 16, marginBottom: 24 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', gap: 16, flexWrap: 'wrap' }}>
               <div>
@@ -789,14 +876,15 @@ function App() {
           <section style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.8fr', gap: 24, marginBottom: 24 }}>
             <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
               <h1 style={{ marginTop: 0 }}>Admin Dashboard</h1>
+              <div style={{ marginBottom: 14, color: '#64748b', fontSize: 13 }}>Live SurveyCTO quality status — a survey is marked good when it has no active outlier. Resolved and cleared findings are removed from the outlier total.</div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 14, marginBottom: 24 }}>
                 {[
-                  { label: 'Raw submissions', value: dashboard?.raw_submission_count ?? 0, accent: '#1d4ed8' },
-                  { label: 'Open issues', value: dashboard?.issue_count ?? 0, accent: '#dc2626' },
+                  { label: 'Surveys pulled', value: dashboard?.total_survey_count ?? 0, accent: '#1d4ed8' },
+                  { label: 'Good surveys', value: dashboard?.good_survey_count ?? 0, accent: '#059669' },
+                  { label: 'Active outliers', value: dashboard?.outlier_survey_count ?? 0, accent: '#dc2626' },
                   { label: 'Pending review', value: dashboard?.pending_review_count ?? 0, accent: '#059669' },
                   { label: 'High severity', value: dashboard?.high_severity_count ?? 0, accent: '#d97706' },
                   { label: 'Medium severity', value: dashboard?.medium_severity_count ?? 0, accent: '#f59e0b' },
-                  { label: 'Staff members', value: dashboard?.staff_count ?? 0, accent: '#2563eb' },
                 ].map((metric) => (
                   <div key={metric.label} style={{ background: '#f8fafc', borderRadius: 16, padding: 18 }}>
                     <div style={{ fontSize: 13, fontWeight: 700, color: '#6b7280', marginBottom: 10 }}>{metric.label}</div>
@@ -1156,7 +1244,7 @@ function App() {
           <div style={{ background: '#ffffff', borderRadius: 18, padding: 18, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
               <h2 style={{ margin: 0 }}>Review Queue</h2>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>{sessionRole === 'admin' && <button onClick={runMainSurveyQC} style={{ padding: '7px 10px', borderRadius: 8, border: 'none', background: '#2563eb', color: '#fff', cursor: 'pointer', fontWeight: 700 }}>Run QC checks</button>}<span style={{ color: '#6b7280', fontSize: 14 }}>{issues.length} assigned items</span></div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>{sessionRole === 'admin' && <button onClick={runMainSurveyQC} style={{ padding: '7px 10px', borderRadius: 8, border: 'none', background: '#2563eb', color: '#fff', cursor: 'pointer', fontWeight: 700 }}>Run QC checks</button>}<span style={{ color: '#6b7280', fontSize: 14 }}>Showing {issues.length.toLocaleString()} of {reviewQueueCount.toLocaleString()} items</span></div>
             </div>
 
             {issues.length === 0 ? (
@@ -1190,6 +1278,7 @@ function App() {
                     </div>
                   </button>
                 ))}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, paddingTop: 4 }}><span style={{ color: '#64748b', fontSize: 12 }}>Showing {reviewQueueCount ? reviewQueueOffset + 1 : 0}–{Math.min(reviewQueueOffset + issues.length, reviewQueueCount)} of {reviewQueueCount}</span><div style={{ display: 'flex', gap: 8 }}><button onClick={() => loadReviewQueue(Math.max(0, reviewQueueOffset - 10))} disabled={reviewQueueOffset === 0 || reviewQueueLoading} style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid #cbd5e1', background: '#fff', cursor: reviewQueueOffset === 0 || reviewQueueLoading ? 'default' : 'pointer' }}>Previous</button><button onClick={() => loadReviewQueue(reviewQueueOffset + 10)} disabled={reviewQueueOffset + issues.length >= reviewQueueCount || reviewQueueLoading} style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid #cbd5e1', background: '#fff', cursor: reviewQueueOffset + issues.length >= reviewQueueCount || reviewQueueLoading ? 'default' : 'pointer' }}>Next</button></div></div>
               </div>
             )}
           </div>
@@ -1203,11 +1292,15 @@ function App() {
                   <div style={{ fontWeight: 700 }}>{selectedIssue.issue_summary}</div>
                 </div>
                 <div style={{ background: '#f8fafc', borderRadius: 12, padding: 14 }}>
-                  <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>Evidence</div>
-                  <div>{selectedIssue.evidence || 'No evidence was recorded.'}</div>
+                  <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>What we found</div>
+                  <div>{splitQCReport(selectedIssue.evidence).evidence || 'No evidence was recorded.'}</div>
                 </div>
+                {Object.keys(selectedIssue.context || {}).length > 0 && <div style={{ background: '#f8fafc', borderRadius: 12, padding: 14 }}>
+                  <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 10 }}>Interview context</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>{Object.entries(selectedIssue.context).map(([label, value]) => <div key={label}><div style={{ fontSize: 11, color: '#64748b' }}>{label}</div><div style={{ fontWeight: 700, overflowWrap: 'anywhere' }}>{value}</div></div>)}</div>
+                </div>}
                 <div style={{ padding: 14, borderRadius: 12, background: '#eff6ff', color: '#1e3a5f', lineHeight: 1.55 }}>
-                  <strong>What to review</strong><div style={{ marginTop: 5 }}>Confirm the evidence against the submission, check whether this is a legitimate field condition, then assign a reviewer or record the resolution. This flag is <strong>{selectedIssue.severity}</strong> severity.</div>
+                  <strong>Recommended next check</strong><div style={{ marginTop: 5 }}>{splitQCReport(selectedIssue.evidence).nextCheck || <>Confirm the evidence against the submission, check whether this is a legitimate field condition, then assign a reviewer or record the resolution. This flag is <strong>{selectedIssue.severity}</strong> severity.</>}</div>
                 </div>
                 <div style={{ display: 'grid', gap: 6 }}>
                   <label htmlFor="issue-assignee" style={{ fontSize: 12, color: '#6b7280', fontWeight: 700 }}>Assign reviewer</label>
@@ -1215,6 +1308,11 @@ function App() {
                     <option value="">Unassigned</option>
                     {staffMembers.map((member) => <option key={member.staff_id} value={member.staff_id}>{member.username} — {member.role}</option>)}
                   </select>
+                  {sessionRole === 'admin' ? <>
+                    <label htmlFor="assignment-remark" style={{ fontSize: 12, color: '#6b7280', fontWeight: 700, marginTop: 4 }}>Assignment remark (visible to assigned staff)</label>
+                    <textarea id="assignment-remark" maxLength={1000} value={selectedIssue.assignment_remark || ''} onChange={(event) => setSelectedIssue((current) => ({ ...current, assignment_remark: event.target.value }))} placeholder="Add short context or instructions for this task" rows={3} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', resize: 'vertical', fontFamily: 'inherit' }} />
+                    <button onClick={() => assignIssue(selectedIssue.issue_id, selectedIssue.assigned_to_user_id, selectedIssue.assignment_remark)} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', cursor: 'pointer', fontWeight: 800 }}>Save assignment and remark</button>
+                  </> : <div style={{ background: '#fff7ed', borderRadius: 10, padding: 12, color: '#9a3412' }}><strong>Admin remark</strong><div style={{ marginTop: 4 }}>{selectedIssue.assignment_remark || 'No additional instructions were added.'}</div></div>}
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
                   <div style={{ background: '#f8fafc', borderRadius: 12, padding: 12 }}>

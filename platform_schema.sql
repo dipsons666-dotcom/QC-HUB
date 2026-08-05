@@ -426,6 +426,7 @@ CREATE TABLE IF NOT EXISTS qc.issue_queue (
     issue_status text NOT NULL DEFAULT 'pending_review',
     assigned_to_user_id uuid,
     assigned_to_role text,
+    assignment_remark text,
     issue_summary text NOT NULL,
     resolution_note text,
     created_at timestamptz NOT NULL DEFAULT now(),
