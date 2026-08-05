@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import datetime
-from statistics import median
 from typing import Any, Iterable
 
 
@@ -87,7 +86,7 @@ def evaluate_main_survey(rows: Iterable[tuple[str, dict[str, Any]]]) -> list[dic
 
     durations = [_number(_value(payload, "duration")) for _, payload in cases]
     durations = [value for value in durations if value is not None]
-    if durations:
+    if False and durations:  # Superseded by the interviewer-specific baseline below.
         middle = median(durations)
         for key, payload in cases:
             duration = _number(_value(payload, "duration"))
@@ -114,22 +113,26 @@ def evaluate_main_survey(rows: Iterable[tuple[str, dict[str, Any]]]) -> list[dic
             flag(key, "MAIN_START_TIME", "Interview started outside normal field hours",
                  f"The interview started at {start:%H:%M}, outside the normal review window of 07:00–18:59.",
                  "Confirm that the respondent was genuinely interviewed at this time and verify the timestamp against the audio or fieldwork schedule.")
-        phone = _phone(_value(payload, "phone", "phone_number", "respondent_phone", "devicephonenum"))
-        if phone: by_phone[phone].append((key, interviewer))
+        # Do not use device numbers or partial phone values as a respondent
+        # identifier: only exact 11-digit respondent numbers are comparable.
+        phone = _phone(_value(payload, "Mobile", "phone", "phone_number", "respondent_phone"))
+        if len(phone) == 11: by_phone[phone].append((key, interviewer))
         coordinate = _gps(_value(payload, "gps", "geopoint"))
         if coordinate: by_gps[coordinate].append((key, interviewer))
         by_interviewer[interviewer].append((key, start, end, payload))
 
     for phone, entries in by_phone.items():
         if len(entries) > 1:
+            related_keys = ", ".join(key for key, _ in entries[:20])
+            overflow = "" if len(entries) <= 20 else f" (and {len(entries) - 20} more)"
             for key, _ in entries: flag(key, "MAIN_DUPLICATE_PHONE_NUMBER_GLOBAL", "Respondent phone number appears in multiple interviews",
-                                        f"The phone number ending {phone[-4:]} appears in {len(entries)} active interviews across the survey.",
+                                        f"The full phone number {phone} appears in {len(entries)} active interviews. Related SurveyCTO submission keys: {related_keys}{overflow}.",
                                         "Compare the respondent details and call records. Shared household phones can be legitimate, but separate respondents must be verified.")
         for interviewer in {entry[1] for entry in entries}:
             same = [entry for entry in entries if entry[1] == interviewer]
             if len(same) > 1:
                 for key, _ in same: flag(key, "MAIN_DUPLICATE_PHONE_NUMBER", "Same interviewer reused a respondent phone number",
-                                          f"Interviewer {interviewer} recorded the phone number ending {phone[-4:]} in {len(same)} interviews.",
+                                          f"Interviewer {interviewer} recorded the full phone number {phone} in {len(same)} interviews. Related SurveyCTO submission keys: {', '.join(entry[0] for entry in same[:20])}.",
                                           "Compare these cases for duplicate respondents or reused details; confirm any genuine shared-phone situation with the interviewer.")
     for coordinate, entries in by_gps.items():
         for interviewer in {entry[1] for entry in entries}:
@@ -140,6 +143,23 @@ def evaluate_main_survey(rows: Iterable[tuple[str, dict[str, Any]]]) -> list[dic
                                           "Check whether the interviews occurred in one compound or venue. If not, compare the records and GPS capture settings for possible reuse.")
 
     for interviewer, entries in by_interviewer.items():
+        # Compare an interview with this interviewer's own completed work,
+        # never with a pooled benchmark for every interviewer.
+        duration_entries = [(key, _number(_value(payload, "duration"))) for key, _, _, payload in entries]
+        duration_entries = [(key, duration) for key, duration in duration_entries if duration is not None]
+        if len(duration_entries) >= 5:
+            average_duration = sum(duration for _, duration in duration_entries) / len(duration_entries)
+            for key, duration in duration_entries:
+                if duration < average_duration * .5:
+                    ratio = duration / average_duration
+                    flag(key, "MAIN_LOW_LOI", "Interview completed much faster than this interviewer's usual pace",
+                         f"Interviewer {interviewer} has an average interview duration of {_duration(average_duration)} across {len(duration_entries)} completed interviews. This submission took {_duration(duration)}, which is {ratio:.0%} of that interviewer's average ({_duration(average_duration - duration)} faster). The review threshold is below 50% of the interviewer's average.",
+                         "Compare this submission's timestamps, audio, and key responses with the interviewer's usual work pattern before deciding whether it was rushed or legitimately short.")
+                if duration > average_duration * 1.5:
+                    ratio = duration / average_duration
+                    flag(key, "MAIN_HIGH_LOI", "Interview took much longer than this interviewer's usual pace",
+                         f"Interviewer {interviewer} has an average interview duration of {_duration(average_duration)} across {len(duration_entries)} completed interviews. This submission took {_duration(duration)}, which is {ratio:.1f} times that interviewer's average ({_duration(duration - average_duration)} longer). The review threshold is above 150% of the interviewer's average.",
+                         "Compare this submission's timeline and audio with the interviewer's usual work pattern; a difficult respondent or interruption may explain a genuinely long interview.")
         dated = sorted((entry for entry in entries if entry[1] and entry[2]), key=lambda entry: entry[1])
         for previous, current in zip(dated, dated[1:]):
             _, _, prior_end, _ = previous; key, start, _, _ = current
@@ -152,15 +172,23 @@ def evaluate_main_survey(rows: Iterable[tuple[str, dict[str, Any]]]) -> list[dic
                 flag(key, "MAIN_TIME_INTERWOVEN", "Interview times overlap",
                      f"This interview began {_duration(abs(gap))} before interviewer {interviewer}'s previous interview had ended.",
                      "Check timestamps and audio for both interviews. One interviewer may not be able to conduct overlapping interviews without an explanation.")
-        if len(entries) >= 10:
-            for field, threshold in (("Gender", .9), ("Age_Range", .8), ("Sector", .85), ("P1", .9)):
+        # Demographics and sector concentration checks. Exclude calculated
+        # or derived indicators such as P1 from these fraud signals. Use a
+        # minimum sample size per interviewer before flagging.
+        if len(entries) >= 5:
+            for field, threshold in (("Gender", .9), ("Age_Range", .8), ("Sector", .85)):
                 values = [str(_value(payload, field) or "") for _, _, _, payload in entries]
                 values = [value for value in values if value]
                 if values and max(Counter(values).values()) / len(values) >= threshold:
                     common, count = Counter(values).most_common(1)[0]
                     share = count / len(values)
-                    field_label = {"P1": "Noodles"}.get(field, field.replace("_", " "))
-                    for key, _, _, _ in entries: flag(key, "MAIN_ENUMERATOR_MATRIX_ANOMALY", "Interviewer responses are unusually concentrated",
-                                                       f"For interviewer {interviewer}, {count} of {len(values)} recorded {field_label} responses ({share:.0%}) are in the same category ({common}). The review threshold is {threshold:.0%}.",
-                                                       "Check the interviewer’s sample allocation and respondent selection. A concentration may be expected in a targeted area, but it can also signal repetitive selection.")
+                    field_label = field.replace("_", " ")
+                    # Decode common values for better readability (simple mapping for Gender)
+                    decoded_common = str(common)
+                    if field == "Gender":
+                        decoded_common = {"1": "Male", "2": "Female"}.get(str(common), str(common))
+                    for key, _, _, _ in entries:
+                        flag(key, "MAIN_ENUMERATOR_MATRIX_ANOMALY", "Interviewer responses are unusually concentrated",
+                             f"For interviewer {interviewer}, {count} of {len(values)} recorded {field_label} responses ({share:.0%}) are in the category '{decoded_common}' (raw value: {common}). The review threshold is {threshold:.0%}.",
+                             "Check the interviewer’s sample allocation and respondent selection. A concentration may be expected in a targeted area, but it can also signal repetitive selection.")
     return flags

@@ -29,6 +29,30 @@ def test_can_create_and_list_staff_members():
     assert staff_list[0]["email"] == "jane@example.com"
 
 
+def test_staff_can_login_by_username_or_email():
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/admin/staff",
+        json={"username": "Jane Reviewer", "email": "jane@example.com", "password": "safe-password", "role": "reviewer"},
+    )
+    assert response.status_code == 201
+
+    username_login = client.post(
+        "/api/auth/login",
+        json={"username": "Jane Reviewer", "password": "safe-password"},
+    )
+    assert username_login.status_code == 200
+    assert username_login.json()["username"] == "Jane Reviewer"
+
+    email_login = client.post(
+        "/api/auth/login",
+        json={"username": "jane@example.com", "password": "safe-password"},
+    )
+    assert email_login.status_code == 200
+    assert email_login.json()["username"] == "Jane Reviewer"
+
+
 def test_admin_dashboard_reflects_staff_counts():
     client = TestClient(app)
 

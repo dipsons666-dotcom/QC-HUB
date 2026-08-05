@@ -89,6 +89,12 @@ def _ensure_issue_queue_columns(engine) -> None:
         logging.warning("Unable to ensure issue queue columns exist: %s", exc)
 
 
+def _ensure_issue_queue_severity_column(engine) -> None:
+    """Backward-compatible wrapper expected by some tests: delegate to
+    the newer `_ensure_issue_queue_columns` implementation."""
+    return _ensure_issue_queue_columns(engine)
+
+
 def create_schemas():
     engine = get_engine()
     if os.getenv("SKIP_SCHEMA_CREATION", "false").strip().lower() in ("1", "true", "yes", "y"):

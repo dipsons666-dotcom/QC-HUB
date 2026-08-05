@@ -159,6 +159,35 @@ def decode_submission_to_question_rows(
         )
         count += 1
         if limit is not None and count >= limit:
-            break
+                break
 
-    return rows
+        return rows
+
+
+    def decode_value_for_question(
+        question_name: str,
+        raw_value: Any,
+        metadata_path: str | Path | None = None,
+    ) -> str:
+        """Decode a single question value using the metadata settings.
+
+        Loads the metadata (if provided), resolves the question type and
+        choice list (if any), and returns the human-readable label or
+        stringified raw value.
+        """
+        metadata = _load_metadata(metadata_path)
+        choices, questions = _read_settings(metadata)
+
+        question = next((q for q in questions if q.get("name") == question_name), None)
+        if question is None:
+            return "" if raw_value is None else str(raw_value)
+
+        qtype = question.get("type", "")
+        list_name: str | None = None
+        if isinstance(qtype, str):
+            if qtype.startswith("select_one"):
+                list_name = qtype.split("select_one", 1)[1].strip()
+            elif qtype.startswith("select_multiple"):
+                list_name = qtype.split("select_multiple", 1)[1].strip()
+
+        return _decode_value(raw_value, list_name, choices, qtype)

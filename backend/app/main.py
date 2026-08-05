@@ -22,7 +22,7 @@ import duckdb
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -82,6 +82,7 @@ from .schemas import (
     RuleDefinitionResponse,
     StaffMemberCreate,
     StaffMemberResponse,
+    PasswordChangeRequest,
     SurveyCTOImportRequest,
     SurveyCTOImportResponse,
     SurveyCTOSessionRequest,
@@ -328,8 +329,16 @@ def health_check() -> dict[str, str]:
 
 @app.post("/api/auth/login", response_model=LoginResponse)
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse:
-    username = payload.username.strip()
-    member = db.execute(select(StaffMember).where(StaffMember.username == username)).scalars().first()
+    credential = payload.username.strip()
+    member = (
+        db.execute(
+            select(StaffMember).where(
+                or_(StaffMember.username == credential, StaffMember.email == credential)
+            )
+        )
+        .scalars()
+        .first()
+    )
     if member is None or not member.is_active or not verify_password(payload.password, member.password_hash):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     return LoginResponse(staff_id=str(member.staff_id), username=member.username, role=member.role)
@@ -1471,6 +1480,16 @@ def get_review_queue(
         raw_submission = raw_by_key.get(issue.submission_key) if issue.submission_key else None
         raw_payload = raw_submission.raw_payload if raw_submission is not None else {}
         context = issue_context(raw_payload) if isinstance(raw_payload, dict) else {}
+        if result and result.rule_code in {"MAIN_DUPLICATE_PHONE_NUMBER_GLOBAL", "MAIN_DUPLICATE_PHONE_NUMBER"}:
+            current_phone = "".join(char for char in context.get("Phone", "") if char.isdigit())
+            if current_phone:
+                related_keys = []
+                for submission_key, submission in raw_by_key.items():
+                    payload = submission.raw_payload if isinstance(submission.raw_payload, dict) else {}
+                    candidate = "".join(char for char in value(payload, "Mobile", "phone", "phone_number", "respondent_phone", "devicephonenum") if char.isdigit())
+                    if candidate == current_phone:
+                        related_keys.append(submission_key)
+                context["Related submission keys"] = ", ".join(related_keys[:20])
         return ReviewQueueItem(
             issue_id=str(issue.issue_id), submission_key=issue.submission_key, case_id=issue.case_id,
             issue_status=issue.issue_status, status=issue.issue_status, issue_summary=issue.issue_summary,
@@ -1488,6 +1507,21 @@ def get_review_queue(
         )
 
     return ReviewQueueResponse(issues=[serialize_issue(issue) for issue in issues], count=total_count)
+
+
+@app.get("/api/staff/{staff_id}/dashboard")
+def get_staff_dashboard(staff_id: str, db: Session = Depends(get_db)) -> dict[str, int]:
+    """Return reviewer-specific workload metrics, never the admin aggregate."""
+    member = db.get(StaffMember, staff_id)
+    if member is None:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    assigned = IssueQueue.assigned_to_user_id == staff_id
+    total = db.execute(select(func.count()).select_from(IssueQueue).where(assigned)).scalar_one()
+    pending = db.execute(select(func.count()).select_from(IssueQueue).where(assigned, IssueQueue.issue_status == "pending_review")).scalar_one()
+    in_progress = db.execute(select(func.count()).select_from(IssueQueue).where(assigned, IssueQueue.issue_status.in_(("in_progress", "needs_investigation")))).scalar_one()
+    approved = db.execute(select(func.count()).select_from(IssueQueue).where(assigned, IssueQueue.issue_status.in_(("approved", "resolved")))).scalar_one()
+    rejected = db.execute(select(func.count()).select_from(IssueQueue).where(assigned, IssueQueue.issue_status == "rejected")).scalar_one()
+    return {"assigned_count": total, "pending_count": pending, "in_progress_count": in_progress, "approved_count": approved, "rejected_count": rejected, "completed_count": approved + rejected}
 
 
 @app.get("/api/admin/staff", response_model=list[StaffMemberResponse])
@@ -1530,6 +1564,28 @@ def create_staff_member(payload: StaffMemberCreate, db: Session = Depends(get_db
         role=staff_member.role,
         created_at=staff_member.created_at,
     )
+
+
+@app.delete("/api/admin/staff/{staff_id}", status_code=204)
+def delete_staff_member(staff_id: str, db: Session = Depends(get_db)) -> None:
+    """Remove an account while preserving the review queue and its audit history."""
+    member = db.get(StaffMember, staff_id)
+    if member is None:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    db.execute(update(IssueQueue).where(IssueQueue.assigned_to_user_id == staff_id).values(assigned_to_user_id=None))
+    db.delete(member)
+    db.commit()
+
+
+@app.put("/api/staff/{staff_id}/password", status_code=204)
+def change_staff_password(staff_id: str, payload: PasswordChangeRequest, db: Session = Depends(get_db)) -> None:
+    member = db.get(StaffMember, staff_id)
+    if member is None:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    if not verify_password(payload.current_password, member.password_hash):
+        raise HTTPException(status_code=400, detail="Your current password is incorrect")
+    member.password_hash = hash_password(payload.new_password)
+    db.commit()
 
 
 @app.get("/api/admin/raw-data-table", response_model=RawDataTableResponse)
@@ -1693,7 +1749,7 @@ def _analysis_tables_for_category(
     if clean_only:
         active_outlier_keys = set(db.execute(select(IssueQueue.submission_key).where(
             IssueQueue.submission_key.is_not(None),
-            IssueQueue.issue_status.notin_(("resolved", "rejected")),
+            IssueQueue.issue_status.notin_(("approved", "resolved", "rejected")),
         )).scalars().all())
         raw_rows = [row for row in raw_rows if row.submission_key not in active_outlier_keys]
     payloads = [row.raw_payload for row in raw_rows]
@@ -1835,10 +1891,25 @@ def assign_issue(issue_id: str, payload: IssueAssignmentRequest, db: Session = D
     assignee = db.get(StaffMember, payload.staff_id) if payload.staff_id else None
     if payload.staff_id and assignee is None:
         raise HTTPException(status_code=404, detail="Staff member not found")
-    issue.assigned_to_user_id = assignee.staff_id if assignee else None
-    issue.assigned_to_role = assignee.role if assignee else None
-    issue.assignment_remark = payload.assignment_remark.strip() if payload.assignment_remark and payload.assignment_remark.strip() else None
-    issue.updated_at = datetime.now(timezone.utc)
+    # One submitted outlier may produce several flags. Keep every open flag
+    # under a single owner so the same submission cannot be reviewed twice.
+    related_issues = [issue]
+    if issue.submission_key:
+        related_issues = db.execute(
+            select(IssueQueue).where(
+                IssueQueue.submission_key == issue.submission_key,
+                IssueQueue.issue_status.notin_(("approved", "resolved", "rejected")),
+            )
+        ).scalars().all()
+        conflicting_owner = next((item.assigned_to_user_id for item in related_issues if item.assigned_to_user_id and item.assigned_to_user_id != payload.staff_id), None)
+        if conflicting_owner:
+            owner = db.get(StaffMember, conflicting_owner)
+            raise HTTPException(status_code=409, detail=f"This outlier is already owned by {owner.username if owner else 'another reviewer'}.")
+    for related_issue in related_issues:
+        related_issue.assigned_to_user_id = assignee.staff_id if assignee else None
+        related_issue.assigned_to_role = assignee.role if assignee else None
+        related_issue.assignment_remark = payload.assignment_remark.strip() if payload.assignment_remark and payload.assignment_remark.strip() else None
+        related_issue.updated_at = datetime.now(timezone.utc)
     db.commit(); db.refresh(issue)
     return ReviewQueueItem(issue_id=str(issue.issue_id), submission_key=issue.submission_key, case_id=issue.case_id, issue_status=issue.issue_status, status=issue.issue_status, issue_summary=issue.issue_summary, severity=issue.severity, created_at=issue.created_at, updated_at=issue.updated_at, resolved_at=issue.resolved_at, resolution_note=issue.resolution_note, assigned_to_user_id=str(issue.assigned_to_user_id) if issue.assigned_to_user_id else None, assigned_to_name=assignee.username if assignee else None, assignment_remark=issue.assignment_remark)
 
@@ -1999,7 +2070,7 @@ def get_admin_dashboard(db: Session = Depends(get_db)) -> AdminDashboardResponse
     ).scalar_one()
     active_outlier_keys = select(IssueQueue.submission_key).where(
         IssueQueue.submission_key.is_not(None),
-        IssueQueue.issue_status.notin_(("resolved", "rejected")),
+        IssueQueue.issue_status.notin_(("approved", "resolved", "rejected")),
     ).distinct().subquery()
     outlier_survey_count = db.execute(
         select(func.count()).select_from(active_outlier_keys)
@@ -2016,6 +2087,11 @@ def get_admin_dashboard(db: Session = Depends(get_db)) -> AdminDashboardResponse
         select(func.count()).select_from(IssueQueue).where(IssueQueue.severity == "medium")
     ).scalar_one()
     staff_count = db.execute(select(func.count()).select_from(StaffMember)).scalar_one()
+    total_reviewed_count = db.execute(
+        select(func.count()).select_from(IssueQueue).where(
+            IssueQueue.issue_status.in_(("approved", "resolved", "rejected"))
+        )
+    ).scalar_one()
     last_sync_at = db.execute(select(func.max(RawSurveyCTOSubmission.fetched_at))).scalar_one()
 
     return AdminDashboardResponse(
@@ -2028,6 +2104,7 @@ def get_admin_dashboard(db: Session = Depends(get_db)) -> AdminDashboardResponse
         high_severity_count=high_severity_count,
         medium_severity_count=medium_severity_count,
         staff_count=staff_count,
+        total_reviewed_count=total_reviewed_count,
         last_sync_at=last_sync_at,
     )
 
@@ -2175,7 +2252,7 @@ def update_issue_action(issue_id: str, payload: IssueActionRequest, db: Session 
 
     issue.issue_status = payload.status
     issue.resolution_note = payload.resolution_note
-    if payload.status in {"resolved", "rejected"}:
+    if payload.status in {"approved", "resolved", "rejected"}:
         issue.resolved_at = datetime.now(timezone.utc)
     issue.updated_at = datetime.now(timezone.utc)
     db.commit()

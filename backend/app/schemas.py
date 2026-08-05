@@ -95,7 +95,7 @@ class ReviewQueueResponse(BaseModel):
 
 
 class IssueActionRequest(BaseModel):
-    status: Literal["pending_review", "in_progress", "resolved", "rejected"]
+    status: Literal["pending_review", "in_progress", "approved", "rejected", "needs_investigation", "resolved"]
     resolution_note: str | None = None
 
 
@@ -205,6 +205,11 @@ class StaffMemberResponse(BaseModel):
     created_at: datetime
 
 
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=6)
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -226,6 +231,7 @@ class AdminDashboardResponse(BaseModel):
     high_severity_count: int
     medium_severity_count: int
     staff_count: int
+    total_reviewed_count: int
     last_sync_at: datetime | None = None
 
 

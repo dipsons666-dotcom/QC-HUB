@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import inicioLogo from '../../assets/Inicio-pics2.png';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 
@@ -27,6 +28,7 @@ function App() {
   const [rawSubmissionCount, setRawSubmissionCount] = useState(0);
   const [page, setPage] = useState('home');
   const [adminSidebarOpen, setAdminSidebarOpen] = useState(false);
+  const [staffMenuOpen, setStaffMenuOpen] = useState(false);
   const [sessionRole, setSessionRole] = useState('');
   const [sessionUserId, setSessionUserId] = useState('');
   const [loginName, setLoginName] = useState('');
@@ -35,9 +37,16 @@ function App() {
   const [showRawBrowser, setShowRawBrowser] = useState(false);
   const [syncStatus, setSyncStatus] = useState('');
   const [dashboard, setDashboard] = useState(null);
+  const [staffDashboard, setStaffDashboard] = useState({ assigned_count: 0, pending_count: 0, in_progress_count: 0, approved_count: 0, rejected_count: 0, completed_count: 0 });
   const [qualityOverview, setQualityOverview] = useState({ entities: {}, scoring_note: '' });
+  const [qualityLoading, setQualityLoading] = useState(false);
+  const [cleanAnalysisLoading, setCleanAnalysisLoading] = useState(false);
   const [qualityGroup, setQualityGroup] = useState('interviewers');
   const [staffMembers, setStaffMembers] = useState([]);
+  const [staffSuccess, setStaffSuccess] = useState('');
+  const [staffListPage, setStaffListPage] = useState(0);
+  const [insightQuestionPage, setInsightQuestionPage] = useState(0);
+  const [cleanQuestionPage, setCleanQuestionPage] = useState(0);
   const [rawDataTable, setRawDataTable] = useState({ columns: [], rows: [] });
   const [rawDataOffset, setRawDataOffset] = useState(0);
   const [rawDataPageSize, setRawDataPageSize] = useState(50);
@@ -52,6 +61,8 @@ function App() {
   const [interpretEnabled, setInterpretEnabled] = useState(true);
   const [xlsformMetadata, setXlsformMetadata] = useState(null);
   const [newStaff, setNewStaff] = useState({ username: '', email: '', password: '', role: 'reviewer' });
+  const [passwordChange, setPasswordChange] = useState({ current_password: '', new_password: '', confirm_password: '' });
+  const [accountMessage, setAccountMessage] = useState('');
   const [adminError, setAdminError] = useState('');
   const [queuedImports, setQueuedImports] = useState([]);
   const [queuedCount, setQueuedCount] = useState(0);
@@ -79,6 +90,13 @@ function App() {
       .catch(() => setDashboard(null));
 
     loadReviewQueue();
+
+    if (sessionRole && sessionRole !== 'admin' && sessionUserId) {
+      fetch(`${API_BASE}/api/staff/${encodeURIComponent(sessionUserId)}/dashboard`)
+        .then((response) => response.ok ? response.json() : Promise.reject())
+        .then((data) => setStaffDashboard(data))
+        .catch(() => setStaffDashboard({ assigned_count: 0, pending_count: 0, in_progress_count: 0, approved_count: 0, rejected_count: 0, completed_count: 0 }));
+    }
 
     fetch(`${API_BASE}/api/import/survey-platform/raw?limit=20&include_payload=false`)
       .then((response) => response.json())
@@ -116,13 +134,16 @@ function App() {
   };
 
   const loadQualityOverview = () => {
+    setQualityLoading(true);
     fetch(`${API_BASE}/api/qc/quality-overview`)
       .then((response) => response.ok ? response.json() : Promise.reject())
       .then((data) => setQualityOverview(data))
-      .catch(() => setQualityOverview({ entities: {}, scoring_note: '' }));
+      .catch(() => setQualityOverview({ entities: {}, scoring_note: '' }))
+      .finally(() => setQualityLoading(false));
   };
 
   const loadCleanAnalysis = (questionId = '') => {
+    setCleanAnalysisLoading(true);
     const params = new URLSearchParams({ category: 'noodles' });
     if (questionId) params.set('question_id', questionId);
     fetch(`${API_BASE}/api/analytics/clean-tables?${params.toString()}`)
@@ -131,7 +152,8 @@ function App() {
         setCleanAnalysisTables(data);
         setCleanAnalysisQuestionId(data.question_id || data.tables?.[0]?.id || '');
       })
-      .catch(() => setCleanAnalysisTables({ respondent_count: 0, tables: [], questions: [], question_id: null }));
+      .catch(() => setCleanAnalysisTables({ respondent_count: 0, tables: [], questions: [], question_id: null }))
+      .finally(() => setCleanAnalysisLoading(false));
   };
 
   const loadRawDataPage = (offset = 0, append = false, search = rawDataSearch, pageSize = rawDataPageSize) => {
@@ -195,7 +217,7 @@ function App() {
       .then((d) => setSyncDetails(d))
       .catch(() => setSyncDetails(null));
 
-    if (showRawBrowser) loadRawDataPage(0, false, '', rawDataPageSize);
+    if (showRawBrowser || page === 'raw') loadRawDataPage(0, false, '', rawDataPageSize);
   };
 
   useEffect(() => {
@@ -203,7 +225,7 @@ function App() {
   }, [sessionRole, sessionUserId]);
 
   useEffect(() => {
-    if (page === 'admin' || page === 'raw' || page === 'staff') {
+    if (page === 'admin' || page === 'raw' || page === 'staff' || page === 'staff-registration' || page === 'staff-list') {
       loadAdminData();
     }
   }, [page, showRawBrowser]);
@@ -295,6 +317,7 @@ function App() {
   const handleCreateStaff = (event) => {
     event.preventDefault();
     setAdminError('');
+    setStaffSuccess('');
     fetch(`${API_BASE}/api/admin/staff`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -307,10 +330,30 @@ function App() {
       .then((created) => {
         setStaffMembers((current) => [...current, created]);
         setNewStaff({ username: '', email: '', password: '', role: 'reviewer' });
+        setStaffSuccess(`${created.username} has been registered successfully.`);
+        setStaffListPage(0);
       })
       .catch(() => {
         setAdminError('Unable to add staff. Check the email and try again.');
       });
+  };
+
+  const deleteStaff = (staff) => {
+    if (!window.confirm(`Remove ${staff.username}'s staff account? Their assigned issues will become unassigned.`)) return;
+    fetch(`${API_BASE}/api/admin/staff/${encodeURIComponent(staff.staff_id)}`, { method: 'DELETE' })
+      .then((response) => response.ok ? response : response.json().then((body) => Promise.reject(new Error(body.detail || 'Unable to remove staff'))))
+      .then(() => { setStaffMembers((current) => current.filter((member) => member.staff_id !== staff.staff_id)); setStaffSuccess(`${staff.username}'s account was removed.`); })
+      .catch((error) => setAdminError(error.message));
+  };
+
+  const changePassword = (event) => {
+    event.preventDefault();
+    setAccountMessage('');
+    if (passwordChange.new_password !== passwordChange.confirm_password) { setAccountMessage('New passwords do not match.'); return; }
+    fetch(`${API_BASE}/api/staff/${encodeURIComponent(sessionUserId)}/password`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(passwordChange) })
+      .then(async (response) => { if (response.ok) return; const body = await response.json().catch(() => ({})); throw new Error(body.detail || 'Unable to change password'); })
+      .then(() => { setPasswordChange({ current_password: '', new_password: '', confirm_password: '' }); setAccountMessage('Password updated successfully.'); })
+      .catch((error) => setAccountMessage(error.message));
   };
 
   const assignIssue = (issueId, staffId, assignmentRemark = '') => {
@@ -319,23 +362,26 @@ function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ staff_id: staffId || null, assignment_remark: assignmentRemark || null }),
     })
-      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then(async (response) => {
+        if (response.ok) return response.json();
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || 'Unable to save assignment');
+      })
       .then((updated) => {
         setIssues((current) => current.map((issue) => issue.issue_id === updated.issue_id ? updated : issue));
         setSelectedIssue(updated);
-      });
+      })
+      .catch((error) => setAdminError(error.message));
   };
 
   const updateIssueStatus = (status) => {
     if (!selectedIssue) return;
-    const resolutionNote = status === 'resolved' ? window.prompt('Add a short resolution note for the audit trail:', selectedIssue.resolution_note || '') : selectedIssue.resolution_note;
-    if (status === 'resolved' && resolutionNote === null) return;
     fetch(`${API_BASE}/api/qc/issues/${selectedIssue.issue_id}/action`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status, resolution_note: resolutionNote || null }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status, resolution_note: selectedIssue.resolution_note || null }),
     }).then((response) => response.ok ? response.json() : Promise.reject()).then((updated) => {
       setIssues((current) => current.map((issue) => issue.issue_id === updated.issue_id ? { ...issue, ...updated } : issue));
       setSelectedIssue((current) => ({ ...current, ...updated }));
-      loadAdminData();
+      if (sessionRole === 'admin') loadAdminData(); else loadHomeData();
     });
   };
 
@@ -357,6 +403,19 @@ function App() {
       pending,
     };
   }, [issues]);
+
+  const activePageTitle = {
+    admin: 'Admin Dashboard',
+    home: 'Review Outliers',
+    quality: 'Demographic / Screener Quality',
+    insights: 'Unreviewed Insights',
+    'clean-analysis': 'Reviewed Insights',
+    'staff-dashboard': 'My Dashboard',
+    'staff-registration': 'Staff Registration',
+    'staff-list': 'QC Staff Directory',
+    raw: 'Raw SurveyCTO Data',
+    decoded: 'Decoded Questions',
+  }[page] || 'QC Hub';
 
   const formatDate = (value) => {
     if (!value) return '—';
@@ -397,6 +456,12 @@ function App() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+  };
+
+  const openRawSubmission = (submissionKey) => {
+    setRawDataSearch(submissionKey);
+    setPage('raw');
+    loadRawDataPage(0, false, submissionKey, rawDataPageSize);
   };
 
   const fetchQueued = () => {
@@ -545,6 +610,14 @@ function App() {
     () => analysisTables.tables.find((table) => table.id === selectedAnalysisTableId) || analysisTables.tables[0],
     [analysisTables.tables, selectedAnalysisTableId],
   );
+  const insightQuestionsPerPage = 8;
+  const visibleInsightQuestions = useMemo(() => (analysisTables.questions || []).slice(insightQuestionPage * insightQuestionsPerPage, (insightQuestionPage + 1) * insightQuestionsPerPage), [analysisTables.questions, insightQuestionPage]);
+  const insightQuestionPageCount = Math.max(1, Math.ceil((analysisTables.questions || []).length / insightQuestionsPerPage));
+  const visibleCleanQuestions = useMemo(() => (cleanAnalysisTables.questions || []).slice(cleanQuestionPage * 8, (cleanQuestionPage + 1) * 8), [cleanAnalysisTables.questions, cleanQuestionPage]);
+  const cleanQuestionPageCount = Math.max(1, Math.ceil((cleanAnalysisTables.questions || []).length / 8));
+  const staffPerPage = 8;
+  const visibleStaffMembers = useMemo(() => staffMembers.slice(staffListPage * staffPerPage, (staffListPage + 1) * staffPerPage), [staffMembers, staffListPage]);
+  const staffPageCount = Math.max(1, Math.ceil(staffMembers.length / staffPerPage));
 
   const selectedAnalysisGroups = useMemo(() => {
     if (!selectedAnalysisTable || selectedAnalysisCut === 'Total') return [];
@@ -596,16 +669,18 @@ function App() {
 
   if (!sessionRole) {
     return (
-      <main style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 24, fontFamily: 'Arial, sans-serif', background: 'radial-gradient(circle at top left, #dbeafe, transparent 36%), linear-gradient(135deg, #071c3d, #164e9c)' }}>
+      <main className="login-shell" style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 24, fontFamily: 'Arial, sans-serif', background: 'radial-gradient(circle at 12% 15%, rgba(45,212,191,.28), transparent 24%), radial-gradient(circle at 88% 78%, rgba(56,189,248,.23), transparent 28%), linear-gradient(135deg, #031126, #0b3b79)' }}>
         <section style={{ width: 'min(960px, 100%)', display: 'grid', gridTemplateColumns: '1.15fr .85fr', overflow: 'hidden', borderRadius: 28, background: '#fff', boxShadow: '0 28px 80px rgba(2, 18, 48, .35)', animation: 'fadeUp .5s ease both' }}>
-          <div style={{ padding: '56px 48px', color: '#fff', background: 'linear-gradient(145deg, #0f2a57, #1672d4)' }}>
-            <div style={{ fontWeight: 800, letterSpacing: '.16em', fontSize: 12 }}>QC HUB</div>
+          <div style={{ padding: '56px 48px', color: '#fff', position: 'relative', overflow: 'hidden', background: 'radial-gradient(circle at 80% 15%, rgba(45,212,191,.35), transparent 28%), linear-gradient(145deg, #071b3e, #1266bb)' }}>
+            <div className="data-grid-overlay" />
+            <img src={inicioLogo} alt="Inicio" style={{ width: 158, height: 'auto', position: 'relative', marginBottom: 24 }} />
+            <div style={{ fontWeight: 800, letterSpacing: '.16em', fontSize: 12, position: 'relative' }}>QC HUB</div>
             <h1 style={{ fontSize: 42, lineHeight: 1.08, margin: '20px 0' }}>Quality control that makes every survey defensible.</h1>
             <p style={{ lineHeight: 1.65, opacity: .9 }}>Review evidence-led outliers, assign work, and keep the complete audit trail in one place.</p>
           </div>
-          <form onSubmit={(event) => { event.preventDefault(); setLoginError(''); fetch(`${API_BASE}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: loginName, password: loginPassword }) }).then(async (response) => { if (!response.ok) throw new Error((await response.json()).detail || 'Unable to sign in'); return response.json(); }).then((account) => { setSessionRole(account.role); setSessionUserId(account.staff_id); setLoginName(account.username); setPage('home'); }).catch((error) => setLoginError(error.message)); }} style={{ padding: 48, display: 'grid', alignContent: 'center', gap: 16 }}>
+          <form onSubmit={(event) => { event.preventDefault(); setLoginError(''); fetch(`${API_BASE}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: loginName, password: loginPassword }) }).then(async (response) => { if (!response.ok) throw new Error((await response.json()).detail || 'Unable to sign in'); return response.json(); }).then((account) => { setSessionRole(account.role); setSessionUserId(account.staff_id); setLoginName(account.username); setPage(account.role === 'admin' ? 'admin' : 'staff-dashboard'); }).catch((error) => setLoginError(error.message)); }} style={{ padding: 48, display: 'grid', alignContent: 'center', gap: 16 }}>
             <div><div style={{ color: '#2563eb', fontWeight: 800, fontSize: 12, letterSpacing: '.12em' }}>WELCOME BACK</div><h2 style={{ fontSize: 28, margin: '8px 0' }}>Sign in to your workspace</h2></div>
-            <label style={{ display: 'grid', gap: 7, color: '#475569', fontWeight: 700, fontSize: 13 }}>Username<input required value={loginName} onChange={(event) => setLoginName(event.target.value)} placeholder="Your username" style={{ padding: '13px 14px', border: '1px solid #cbd5e1', borderRadius: 10 }} /></label>
+            <label style={{ display: 'grid', gap: 7, color: '#475569', fontWeight: 700, fontSize: 13 }}>Username or email<input required value={loginName} onChange={(event) => setLoginName(event.target.value)} placeholder="Username or email" style={{ padding: '13px 14px', border: '1px solid #cbd5e1', borderRadius: 10 }} /></label>
             <label style={{ display: 'grid', gap: 7, color: '#475569', fontWeight: 700, fontSize: 13 }}>Password<input required type="password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} placeholder="Your password" style={{ padding: '13px 14px', border: '1px solid #cbd5e1', borderRadius: 10 }} /></label>
             <button style={{ padding: 14, border: 0, borderRadius: 10, background: '#1368ce', color: '#fff', fontWeight: 800, cursor: 'pointer' }}>Sign in</button>
             {loginError && <div style={{ color: '#b91c1c', fontWeight: 700, fontSize: 13 }}>{loginError}</div>}
@@ -617,11 +692,12 @@ function App() {
   }
 
   return (
-    <div style={{ fontFamily: 'Arial, sans-serif', background: '#f3f4f6', minHeight: '100vh', color: '#111827' }}>
-      <div style={{ maxWidth: 1280, margin: '0 auto', padding: 24 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+    <div className="app-shell" style={{ fontFamily: 'Arial, sans-serif', background: 'radial-gradient(circle at 92% 4%, rgba(56,189,248,.16), transparent 23%), radial-gradient(circle at 8% 30%, rgba(45,212,191,.12), transparent 21%), #f4f8fc', minHeight: '100vh', color: '#111827' }}>
+      <div className="data-orb orb-one" /><div className="data-orb orb-two" />
+      <div style={{ maxWidth: 1280, margin: '0 auto', padding: 24, position: 'relative', zIndex: 1 }}>
+        <div className="workspace-nav" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
-            <div style={{ fontWeight: 800, color: '#163c70', marginRight: 8 }}>QC Hub</div>
+            <div className="brand-lockup" style={{ marginRight: 8 }}><img src={inicioLogo} alt="Inicio" /><span>QC Hub</span></div>
             {sessionRole !== 'admin' && <button
               onClick={() => setPage('quality')}
               style={{
@@ -630,7 +706,7 @@ function App() {
                 background: page === 'quality' ? '#eff6ff' : '#ffffff', cursor: 'pointer', fontWeight: 700,
               }}
             >
-              Quality overview
+              Demographic / Screener Quality
             </button>}
             {sessionRole !== 'admin' && <button
               onClick={() => setPage('insights')}
@@ -644,21 +720,7 @@ function App() {
                 fontWeight: 700,
               }}
             >
-              Insights
-            </button>}
-            {sessionRole !== 'admin' && <button
-              onClick={() => setPage('home')}
-              style={{
-                padding: '12px 18px',
-                marginRight: 10,
-                borderRadius: 12,
-                border: page === 'home' ? '2px solid #2563eb' : '1px solid #d1d5db',
-                background: page === 'home' ? '#eff6ff' : '#ffffff',
-                cursor: 'pointer',
-                fontWeight: 700,
-              }}
-            >
-              Review workspace
+              Unreviewed Insights
             </button>}
             {sessionRole === 'admin' && <button
               onClick={() => setPage('admin')}
@@ -676,13 +738,13 @@ function App() {
           </div>
           {sessionRole === 'admin' && <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
             <span style={{ color: '#64748b', fontSize: 13, fontWeight: 700 }}>{sessionRole === 'admin' ? 'Administrator' : 'Staff reviewer'} {loginName ? `· ${loginName}` : ''}</span>
-            <button
+            {page === 'admin' && <button
               onClick={handleSync}
-              style={{ padding: '12px 18px', borderRadius: 12, border: 'none', background: '#2563eb', color: '#ffffff', cursor: 'pointer', fontWeight: 700 }}
+              style={{ padding: '12px 18px', borderRadius: 12, border: 'none', background: 'linear-gradient(135deg, #0ea5e9, #2563eb)', color: '#ffffff', cursor: 'pointer', fontWeight: 800, boxShadow: '0 8px 18px rgba(37,99,235,.22)' }}
             >
-              Sync SurveyCTO
-            </button>
-            {syncStatus && (
+              Sync Data
+            </button>}
+            {page === 'admin' && syncStatus && (
               <div style={{ color: syncStatus.startsWith('Sync failed') ? '#b91c1c' : '#1f2937', fontSize: 14, fontWeight: 700 }}>
                 {syncStatus}
               </div>
@@ -692,22 +754,71 @@ function App() {
           {sessionRole !== 'admin' && <button onClick={() => { setSessionRole(''); setSessionUserId(''); setLoginName(''); }} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', background: '#fff', color: '#334155', cursor: 'pointer', fontWeight: 700 }}>Sign out</button>}
         </div>
 
+        <div style={{ margin: '-8px 0 20px', color: '#0f3e76', fontWeight: 800, fontSize: 14, letterSpacing: '.04em' }}>
+          {activePageTitle}
+        </div>
+
+        {(insightsLoading || qualityLoading || cleanAnalysisLoading || rawDataLoading || decodedLoading || reviewQueueLoading) && <div style={{ position: 'fixed', zIndex: 200, right: 24, bottom: 24, display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderRadius: 16, background: 'rgba(15, 42, 87, .96)', color: '#fff', boxShadow: '0 16px 34px rgba(15,23,42,.28)', animation: 'fadeUp .25s ease both' }}><div style={{ width: 28, height: 34, border: '2px solid #bfdbfe', borderRadius: '5px 5px 9px 9px', overflow: 'hidden', position: 'relative' }}><div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: '65%', background: 'linear-gradient(#7dd3fc, #2563eb)', animation: 'waterFill 1.1s ease-in-out infinite alternate' }} /></div><div><div style={{ fontSize: 13, fontWeight: 800 }}>Refreshing data…</div><div style={{ marginTop: 2, color: '#bfdbfe', fontSize: 12 }}>Please wait while your workspace updates.</div></div></div>}
+        <style>{`@keyframes waterFill { from { height: 22%; } to { height: 82%; } }
+          @keyframes dataDrift { 0%,100% { transform:translate3d(0,0,0) } 50% { transform:translate3d(18px,-14px,0) } }
+          .app-shell { position:relative; overflow:hidden; }
+          .app-shell::before { content:''; position:absolute; inset:0; opacity:.34; pointer-events:none; background-image:linear-gradient(rgba(30,64,175,.07) 1px, transparent 1px),linear-gradient(90deg, rgba(30,64,175,.07) 1px, transparent 1px); background-size:32px 32px; mask-image:linear-gradient(to bottom, #000, transparent 72%); }
+          .data-orb { position:fixed; z-index:0; width:280px; height:280px; border-radius:50%; pointer-events:none; filter:blur(2px); opacity:.5; animation:dataDrift 11s ease-in-out infinite; }
+          .orb-one { top:110px; right:-130px; background:radial-gradient(circle, rgba(14,165,233,.22), transparent 68%); }
+          .orb-two { bottom:20px; left:-130px; background:radial-gradient(circle, rgba(20,184,166,.16), transparent 68%); animation-delay:-5s; }
+          .workspace-nav { padding:10px 12px; border:1px solid rgba(191,219,254,.8); border-radius:18px; background:rgba(255,255,255,.8); box-shadow:0 12px 34px rgba(15,23,42,.08); backdrop-filter:blur(14px); }
+          .brand-lockup { display:flex; align-items:center; gap:10px; min-height:46px; padding:5px 12px 5px 8px; border-radius:12px; color:#fff; background:linear-gradient(135deg, #071b3e, #1457a6); box-shadow:0 8px 18px rgba(15,42,87,.18); font-size:14px; font-weight:800; letter-spacing:.03em; }
+          .brand-lockup img { width:64px; height:34px; object-fit:contain; object-position:left center; }
+          .app-shell button { transition:transform .16s ease, box-shadow .16s ease, filter .16s ease; }
+          .app-shell button:hover:not(:disabled) { transform:translateY(-1px); filter:saturate(1.08); }
+          @media (max-width: 760px) { .workspace-nav { align-items:flex-start !important; gap:12px; flex-direction:column; } .workspace-nav > div:last-child { flex-wrap:wrap; } .app-shell [style*="repeat(4, minmax(0, 1fr))"] { grid-template-columns:repeat(2, minmax(0, 1fr)) !important; } }
+        `}</style>
+
         {sessionRole === 'admin' && <aside
           onMouseEnter={() => setAdminSidebarOpen(true)}
           onMouseLeave={() => setAdminSidebarOpen(false)}
           style={{ position: 'fixed', zIndex: 20, top: 92, left: 0, width: adminSidebarOpen ? 230 : 54, overflow: 'hidden', borderRadius: '0 14px 14px 0', background: '#0f2a57', boxShadow: '0 8px 24px rgba(15, 42, 87, .25)', transition: 'width .18s ease' }}
         >
           <div style={{ padding: '14px 17px', color: '#bfdbfe', fontSize: 20, fontWeight: 800 }}>☰</div>
-          {[['home', 'Review workspace'], ['quality', 'Quality overview'], ['insights', 'Insights'], ['clean-analysis', 'Clean data analysis'], ['staff', 'Staff registration']].map(([target, label]) => <button key={target} onClick={() => setPage(target)} title={label} style={{ display: 'block', width: '100%', padding: '12px 17px', border: 0, borderLeft: page === target ? '3px solid #93c5fd' : '3px solid transparent', background: page === target ? '#1d4ed8' : 'transparent', color: '#fff', cursor: 'pointer', fontWeight: 700, whiteSpace: 'nowrap', textAlign: 'left' }}>{adminSidebarOpen ? label : label.charAt(0)}</button>)}
+          {[['admin', 'Admin dashboard'], ['home', 'Review outliers'], ['raw', 'Raw SurveyCTO pulls'], ['quality', 'Demographic / screener quality'], ['insights', 'Unreviewed insights'], ['clean-analysis', 'Reviewed insights']].map(([target, label]) => <button key={target} onClick={() => setPage(target)} title={label} style={{ display: 'block', width: '100%', padding: '12px 17px', border: 0, borderLeft: page === target ? '3px solid #93c5fd' : '3px solid transparent', background: page === target ? '#1d4ed8' : 'transparent', color: '#fff', cursor: 'pointer', fontWeight: 700, whiteSpace: 'nowrap', textAlign: 'left' }}>{adminSidebarOpen ? label : label.charAt(0)}</button>)}
+          <div onMouseEnter={() => setStaffMenuOpen(true)} onMouseLeave={() => setStaffMenuOpen(false)}><button onClick={() => { setPage('staff-registration'); setStaffMenuOpen(true); }} title="Staff accounts" style={{ display: 'block', width: '100%', padding: '12px 17px', border: 0, borderLeft: ['staff-registration', 'staff-list'].includes(page) ? '3px solid #93c5fd' : '3px solid transparent', background: ['staff-registration', 'staff-list'].includes(page) ? '#1d4ed8' : 'transparent', color: '#fff', cursor: 'pointer', fontWeight: 700, whiteSpace: 'nowrap', textAlign: 'left' }}>{adminSidebarOpen ? 'Staff accounts ›' : 'S'}</button>{adminSidebarOpen && staffMenuOpen && <div style={{ padding: '0 10px 10px 25px', display: 'grid', gap: 5, background: 'rgba(2, 23, 55, .25)' }}><button onClick={() => setPage('staff-registration')} style={{ padding: '8px 9px', border: 0, borderRadius: 8, background: 'rgba(255,255,255,.12)', color: '#dbeafe', textAlign: 'left', cursor: 'pointer', fontSize: 12, fontWeight: 700 }}>Staff registration</button><button onClick={() => setPage('staff-list')} style={{ padding: '8px 9px', border: 0, borderRadius: 8, background: 'rgba(255,255,255,.12)', color: '#dbeafe', textAlign: 'left', cursor: 'pointer', fontSize: 12, fontWeight: 700 }}>List of QC staff</button></div>}</div>
         </aside>}
 
-        {page === 'clean-analysis' ? (
+        {sessionRole !== 'admin' && <aside
+          onMouseEnter={() => setAdminSidebarOpen(true)}
+          onMouseLeave={() => setAdminSidebarOpen(false)}
+          style={{ position: 'fixed', zIndex: 20, top: 92, left: 0, width: adminSidebarOpen ? 238 : 58, overflow: 'hidden', borderRadius: '0 16px 16px 0', background: 'linear-gradient(180deg, #102a56, #173f7a)', boxShadow: '0 12px 30px rgba(15, 42, 87, .28)', transition: 'width .18s ease' }}
+        >
+          <div style={{ padding: '15px 19px', color: '#bfdbfe', fontSize: 18, fontWeight: 800 }}>✦</div>
+          {[['staff-dashboard', 'My dashboard'], ['quality', 'Demographic / screener quality'], ['insights', 'Unreviewed insights']].map(([target, label]) => <button key={target} onClick={() => setPage(target)} title={label} style={{ display: 'block', width: '100%', padding: '13px 18px', border: 0, borderLeft: page === target ? '3px solid #7dd3fc' : '3px solid transparent', background: page === target ? 'rgba(59,130,246,.35)' : 'transparent', color: '#fff', cursor: 'pointer', fontWeight: 700, whiteSpace: 'nowrap', textAlign: 'left' }}>{adminSidebarOpen ? label : label.charAt(0)}</button>)}
+        </aside>}
+
+        {page === 'staff-dashboard' && sessionRole !== 'admin' ? (
+          <section style={{ display: 'grid', gap: 20, marginBottom: 24 }}>
+            <div style={{ padding: '28px 30px', borderRadius: 22, color: '#fff', background: 'radial-gradient(circle at 85% 5%, rgba(125,211,252,.38), transparent 26%), linear-gradient(120deg, #102a56, #2563b8)' }}>
+              <div style={{ fontSize: 12, fontWeight: 800, letterSpacing: '.16em', color: '#bae6fd' }}>REVIEWER WORKSPACE</div>
+              <h1 style={{ margin: '8px 0', fontSize: 32 }}>Good to see you, {loginName}.</h1>
+              <p style={{ margin: 0, opacity: .88 }}>Your queue is focused on the outliers assigned to you—clear decisions, useful notes, and no duplicate ownership.</p>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 14 }}>
+              {[
+                ['Assigned to me', staffDashboard.assigned_count, '#e0f2fe', '#075985'],
+                ['Ready to review', staffDashboard.pending_count, '#fef3c7', '#92400e'],
+                ['In investigation', staffDashboard.in_progress_count, '#ede9fe', '#5b21b6'],
+                ['Decisions made', staffDashboard.completed_count, '#dcfce7', '#166534'],
+              ].map(([label, value, bg, color]) => <div key={label} style={{ padding: 18, borderRadius: 18, background: bg, color }}><div style={{ fontSize: 12, fontWeight: 800, letterSpacing: '.08em', textTransform: 'uppercase' }}>{label}</div><div style={{ fontSize: 34, fontWeight: 800, marginTop: 8 }}>{Number(value).toLocaleString()}</div></div>)}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderRadius: 16, padding: 18, background: '#fff', boxShadow: '0 8px 28px rgba(15,23,42,.06)' }}><div><strong>Next up: your assigned outliers</strong><div style={{ marginTop: 4, color: '#64748b', fontSize: 14 }}>Review evidence and leave a decision note for the admin.</div></div><button onClick={() => setPage('home')} style={{ padding: '10px 14px', border: 0, borderRadius: 10, background: '#2563eb', color: '#fff', cursor: 'pointer', fontWeight: 800 }}>Open my queue</button></div>
+            <form onSubmit={changePassword} style={{ maxWidth: 560, display: 'grid', gap: 12, padding: 20, borderRadius: 16, background: '#fff', boxShadow: '0 8px 28px rgba(15,23,42,.06)' }}><div><div style={{ color: '#2563eb', fontSize: 12, fontWeight: 800, letterSpacing: '.1em' }}>ACCOUNT SECURITY</div><h2 style={{ margin: '5px 0 0', fontSize: 20 }}>Change password</h2></div><input required type="password" value={passwordChange.current_password} onChange={(event) => setPasswordChange((current) => ({ ...current, current_password: event.target.value }))} placeholder="Current password" style={{ padding: '11px 12px', borderRadius: 10, border: '1px solid #cbd5e1' }} /><input required minLength={6} type="password" value={passwordChange.new_password} onChange={(event) => setPasswordChange((current) => ({ ...current, new_password: event.target.value }))} placeholder="New password (minimum 6 characters)" style={{ padding: '11px 12px', borderRadius: 10, border: '1px solid #cbd5e1' }} /><input required minLength={6} type="password" value={passwordChange.confirm_password} onChange={(event) => setPasswordChange((current) => ({ ...current, confirm_password: event.target.value }))} placeholder="Confirm new password" style={{ padding: '11px 12px', borderRadius: 10, border: '1px solid #cbd5e1' }} /><button style={{ justifySelf: 'start', padding: '10px 14px', border: 0, borderRadius: 10, background: '#0f766e', color: '#fff', cursor: 'pointer', fontWeight: 800 }}>Update password</button>{accountMessage && <div style={{ color: accountMessage.includes('success') ? '#166534' : '#b91c1c', fontWeight: 700, fontSize: 13 }}>{accountMessage}</div>}</form>
+          </section>
+        ) : page === 'clean-analysis' ? (
           <section style={{ display: 'grid', gridTemplateColumns: '260px minmax(0, 1fr)', gap: 18, marginBottom: 24 }}>
-            <div style={{ background: '#fff', borderRadius: 16, padding: 16, boxShadow: '0 8px 28px rgba(15, 23, 42, .06)' }}><div style={{ color: '#15803d', fontSize: 12, fontWeight: 800, letterSpacing: '.1em' }}>QC-CLEARED DATA</div><h2 style={{ margin: '8px 0' }}>{cleanAnalysisTables.respondent_count.toLocaleString()} eligible submissions</h2><p style={{ color: '#64748b', fontSize: 13 }}>Only records with no active red flags are included. Resolved or cleared outliers enter automatically.</p><div style={{ display: 'grid', gap: 6 }}>{(cleanAnalysisTables.questions || []).map((question) => <button key={question.id} onClick={() => loadCleanAnalysis(question.id)} style={{ padding: '9px 10px', border: 0, borderRadius: 8, textAlign: 'left', cursor: 'pointer', background: question.id === cleanAnalysisQuestionId ? '#dcfce7' : 'transparent', fontWeight: question.id === cleanAnalysisQuestionId ? 700 : 500 }}>{question.label}</button>)}</div></div>
+            <div style={{ background: '#fff', borderRadius: 16, padding: 16, boxShadow: '0 8px 28px rgba(15, 23, 42, .06)' }}><div style={{ color: '#15803d', fontSize: 12, fontWeight: 800, letterSpacing: '.1em' }}>QC-CLEARED DATA</div><h2 style={{ margin: '8px 0' }}>{cleanAnalysisTables.respondent_count.toLocaleString()} eligible submissions</h2><p style={{ color: '#64748b', fontSize: 13 }}>Only records with no active red flags are included. Resolved or cleared outliers enter automatically.</p><div style={{ display: 'grid', gap: 8 }}>{visibleCleanQuestions.map((question, index) => <button key={question.id} onClick={() => loadCleanAnalysis(question.id)} style={{ padding: '11px 10px', border: question.id === cleanAnalysisQuestionId ? '1px solid #86efac' : '1px solid transparent', borderRadius: 10, textAlign: 'left', cursor: 'pointer', background: question.id === cleanAnalysisQuestionId ? 'linear-gradient(135deg, #dcfce7, #f0fdf4)' : '#f8fafc', color: '#14532d', fontWeight: question.id === cleanAnalysisQuestionId ? 800 : 600, boxShadow: question.id === cleanAnalysisQuestionId ? '0 5px 14px rgba(22,163,74,.12)' : 'none' }}><span style={{ display: 'inline-flex', width: 20, height: 20, alignItems: 'center', justifyContent: 'center', borderRadius: 999, marginRight: 7, background: '#bbf7d0', fontSize: 11 }}>{cleanQuestionPage * 8 + index + 1}</span>{question.label}</button>)}</div><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 13 }}><button onClick={() => setCleanQuestionPage((page) => Math.max(0, page - 1))} disabled={cleanQuestionPage === 0} style={{ padding: '7px 10px', borderRadius: 8, border: '1px solid #bbf7d0', background: '#fff', opacity: cleanQuestionPage ? 1 : .45 }}>Previous</button><span style={{ fontSize: 12, color: '#64748b' }}>{cleanQuestionPage + 1}/{cleanQuestionPageCount}</span><button onClick={() => setCleanQuestionPage((page) => Math.min(cleanQuestionPageCount - 1, page + 1))} disabled={cleanQuestionPage >= cleanQuestionPageCount - 1} style={{ padding: '7px 10px', borderRadius: 8, border: 0, background: '#16a34a', color: '#fff', opacity: cleanQuestionPage < cleanQuestionPageCount - 1 ? 1 : .45 }}>Next</button></div></div>
             <div style={{ background: '#fff', borderRadius: 16, padding: 20, boxShadow: '0 8px 28px rgba(15, 23, 42, .06)' }}>{(() => { const table = cleanAnalysisTables.tables?.find((item) => item.id === cleanAnalysisQuestionId) || cleanAnalysisTables.tables?.[0]; return <><div style={{ color: '#15803d', fontSize: 12, fontWeight: 800, letterSpacing: '.1em' }}>CLEAN DATA ANALYSIS</div><h1 style={{ margin: '6px 0 16px' }}>{table?.title || 'Select a question'}</h1>{table ? <table style={{ width: '100%', borderCollapse: 'collapse' }}><thead><tr style={{ textAlign: 'left', background: '#f0fdf4' }}><th style={{ padding: 11 }}>Response</th><th style={{ padding: 11, textAlign: 'right' }}>N</th><th style={{ padding: 11, textAlign: 'right' }}>%</th></tr></thead><tbody>{table.rows.map((row) => <tr key={row.label} style={{ borderTop: '1px solid #e5e7eb' }}><td style={{ padding: 11 }}>{row.label}</td><td style={{ padding: 11, textAlign: 'right' }}>{row.count.toLocaleString()}</td><td style={{ padding: 11, textAlign: 'right' }}>{row.pct}%</td></tr>)}</tbody></table> : <p style={{ color: '#64748b' }}>No QC-cleared data is available yet.</p>}</>; })()}</div>
           </section>
-        ) : page === 'staff' ? (
+        ) : (page === 'staff-registration' || page === 'staff-list') ? (<><style>{page === 'staff-registration' ? 'section[style*="max-width: 780px"] { display: none !important; }' : 'section[style*="max-width: 680px"] { display: none !important; }'}</style>
           <section style={{ maxWidth: 680, background: '#fff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, .06)', marginBottom: 24 }}><div style={{ color: '#2563eb', fontSize: 12, letterSpacing: '.12em', fontWeight: 800 }}>ADMIN ONLY</div><h1 style={{ margin: '6px 0 18px' }}>Staff registration</h1><form onSubmit={handleCreateStaff} style={{ display: 'grid', gap: 14 }}><input required value={newStaff.username} onChange={(e) => setNewStaff({ ...newStaff, username: e.target.value })} placeholder="Name" style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }} /><input required value={newStaff.email} onChange={(e) => setNewStaff({ ...newStaff, email: e.target.value })} placeholder="Email" type="email" style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }} /><input required value={newStaff.password} onChange={(e) => setNewStaff({ ...newStaff, password: e.target.value })} placeholder="Temporary password (minimum 6 characters)" type="password" minLength={6} style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }} /><select value={newStaff.role} onChange={(e) => setNewStaff({ ...newStaff, role: e.target.value })} style={{ padding: '12px 14px', borderRadius: 12, border: '1px solid #d1d5db' }}><option value="reviewer">Reviewer</option><option value="admin">Admin</option></select><button style={{ padding: '12px 16px', borderRadius: 12, border: 0, background: '#10b981', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>Register staff</button>{adminError && <div style={{ color: '#b91c1c' }}>{adminError}</div>}</form></section>
+          <section style={{ maxWidth: 780, background: '#fff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, .06)', marginBottom: 24 }}><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}><div><div style={{ color: '#2563eb', fontSize: 12, letterSpacing: '.12em', fontWeight: 800 }}>STAFF DIRECTORY</div><h2 style={{ margin: '5px 0 0' }}>Registered staff</h2></div><span style={{ color: '#64748b' }}>{staffMembers.length} total</span></div>{staffSuccess && <div role="status" style={{ marginBottom: 14, padding: '11px 13px', borderRadius: 10, background: '#dcfce7', color: '#166534', fontWeight: 700 }}>{staffSuccess}</div>}<div style={{ display: 'grid', gap: 9 }}>{visibleStaffMembers.map((member) => <div key={member.staff_id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, padding: 13, borderRadius: 12, background: '#f8fafc', border: '1px solid #e2e8f0' }}><div><strong>{member.username}</strong><div style={{ marginTop: 3, color: '#64748b', fontSize: 13 }}>{member.email}</div></div><div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span style={{ padding: '5px 9px', borderRadius: 999, background: '#dbeafe', color: '#1d4ed8', fontSize: 12, fontWeight: 800 }}>{member.role}</span><button onClick={() => deleteStaff(member)} style={{ padding: '7px 9px', borderRadius: 8, border: '1px solid #fecaca', background: '#fff', color: '#b91c1c', cursor: 'pointer', fontWeight: 800 }}>Remove</button></div></div>)}</div><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 16 }}><span style={{ fontSize: 13, color: '#64748b' }}>Page {staffListPage + 1} of {staffPageCount}</span><div style={{ display: 'flex', gap: 8 }}><button onClick={() => setStaffListPage((page) => Math.max(0, page - 1))} disabled={staffListPage === 0} style={{ padding: '8px 12px', borderRadius: 9, border: '1px solid #cbd5e1', background: '#fff', cursor: staffListPage ? 'pointer' : 'default', opacity: staffListPage ? 1 : .45 }}>Previous</button><button onClick={() => setStaffListPage((page) => Math.min(staffPageCount - 1, page + 1))} disabled={staffListPage >= staffPageCount - 1} style={{ padding: '8px 12px', borderRadius: 9, border: 0, background: '#2563eb', color: '#fff', cursor: staffListPage < staffPageCount - 1 ? 'pointer' : 'default', opacity: staffListPage < staffPageCount - 1 ? 1 : .45 }}>Next</button></div></div></section></>
         ) : page === 'quality' ? (
           <section style={{ display: 'grid', gap: 16, marginBottom: 24 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', gap: 12, flexWrap: 'wrap' }}>
@@ -734,11 +845,12 @@ function App() {
             <section style={{ display: 'grid', gridTemplateColumns: '280px minmax(0, 1fr)', background: '#ffffff', borderRadius: 22, overflow: 'hidden', boxShadow: '0 12px 30px rgba(15, 23, 42, 0.06)' }}>
               <aside style={{ padding: 18, background: '#f8fafc', borderRight: '1px solid #e2e8f0', maxHeight: '72vh', overflowY: 'auto' }}>
                 <div style={{ color: '#0875b8', fontSize: 12, fontWeight: 800, letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 10 }}>Questions</div>
-                <select value={selectedAnalysisTableId} onChange={(event) => loadInsights(selectedAnalysisCut === 'Total' ? '' : selectedAnalysisCut, event.target.value)} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #cbd5e1', background: '#fff', marginBottom: 12 }}>
+                {false && <select value={selectedAnalysisTableId} onChange={(event) => loadInsights(selectedAnalysisCut === 'Total' ? '' : selectedAnalysisCut, event.target.value)} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #cbd5e1', background: '#fff', marginBottom: 12 }}>
                   {(analysisTables.questions || []).map((question) => <option key={question.id} value={question.id}>{question.label}</option>)}
-                </select>
-                <div style={{ display: 'grid', gap: 6 }}>{(analysisTables.questions || []).map((question) => <button key={question.id} onClick={() => loadInsights(selectedAnalysisCut === 'Total' ? '' : selectedAnalysisCut, question.id)} style={{ padding: '9px 10px', border: 'none', borderRadius: 8, textAlign: 'left', cursor: 'pointer', background: question.id === selectedAnalysisTableId ? '#dbeafe' : 'transparent', color: '#1e3a5f', fontSize: 12, fontWeight: question.id === selectedAnalysisTableId ? 700 : 500 }}>{question.label}</button>)}</div>
-                <div style={{ marginTop: 14 }}>
+                </select>}
+                <div style={{ display: 'grid', gap: 8 }}>{visibleInsightQuestions.map((question, index) => <button key={question.id} onClick={() => loadInsights(selectedAnalysisCut === 'Total' ? '' : selectedAnalysisCut, question.id)} style={{ padding: '12px 12px', border: question.id === selectedAnalysisTableId ? '1px solid #93c5fd' : '1px solid transparent', borderRadius: 12, textAlign: 'left', cursor: 'pointer', background: question.id === selectedAnalysisTableId ? 'linear-gradient(135deg, #dbeafe, #eff6ff)' : '#fff', color: '#163c70', fontSize: 13, lineHeight: 1.35, fontWeight: question.id === selectedAnalysisTableId ? 800 : 600, boxShadow: question.id === selectedAnalysisTableId ? '0 6px 16px rgba(37,99,235,.12)' : '0 1px 2px rgba(15,23,42,.04)', transition: 'transform .15s ease, box-shadow .15s ease' }}><span style={{ display: 'inline-flex', width: 22, height: 22, alignItems: 'center', justifyContent: 'center', marginRight: 8, borderRadius: 999, background: question.id === selectedAnalysisTableId ? '#2563eb' : '#e2e8f0', color: question.id === selectedAnalysisTableId ? '#fff' : '#475569', fontSize: 11 }}>{insightQuestionPage * insightQuestionsPerPage + index + 1}</span>{question.label}</button>)}</div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginTop: 14 }}><button onClick={() => setInsightQuestionPage((page) => Math.max(0, page - 1))} disabled={insightQuestionPage === 0} style={{ padding: '8px 11px', borderRadius: 9, border: '1px solid #cbd5e1', background: '#fff', cursor: insightQuestionPage ? 'pointer' : 'default', opacity: insightQuestionPage ? 1 : .45 }}>Previous</button><span style={{ color: '#64748b', fontSize: 12, fontWeight: 700 }}>{insightQuestionPage + 1} / {insightQuestionPageCount}</span><button onClick={() => setInsightQuestionPage((page) => Math.min(insightQuestionPageCount - 1, page + 1))} disabled={insightQuestionPage >= insightQuestionPageCount - 1} style={{ padding: '8px 11px', borderRadius: 9, border: 0, background: '#2563eb', color: '#fff', cursor: insightQuestionPage < insightQuestionPageCount - 1 ? 'pointer' : 'default', opacity: insightQuestionPage < insightQuestionPageCount - 1 ? 1 : .45 }}>Next</button></div>
+                {false && <div style={{ marginTop: 14 }}>
                   <div style={{ color: '#64748b', fontSize: 12, fontWeight: 800, marginBottom: 8 }}>Options</div>
                   {selectedAnalysisTable ? (
                     <div style={{ display: 'grid', gap: 8 }}>
@@ -763,7 +875,7 @@ function App() {
                     <div style={{ color: '#9ca3af', fontSize: 13 }}>Select a question to view its options.</div>
                   )}
                 </div>
-              </aside>
+              }</aside>
               <div style={{ padding: 22, minWidth: 0 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'end', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
                 <div>
@@ -875,16 +987,14 @@ function App() {
         ) : page === 'admin' ? (
           <section style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.8fr', gap: 24, marginBottom: 24 }}>
             <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
-              <h1 style={{ marginTop: 0 }}>Admin Dashboard</h1>
+              <div style={{ marginBottom: 18, paddingBottom: 16, borderBottom: '1px solid #dbeafe' }}><div style={{ fontSize: 12, fontWeight: 800, letterSpacing: '.14em', color: '#2563eb' }}>OPERATIONS OVERVIEW</div><h1 style={{ margin: '7px 0 0', fontSize: 30, color: '#0f2a57' }}>Admin Dashboard</h1><div style={{ marginTop: 6, color: '#64748b' }}>A focused view of data health and review activity.</div></div>
               <div style={{ marginBottom: 14, color: '#64748b', fontSize: 13 }}>Live SurveyCTO quality status — a survey is marked good when it has no active outlier. Resolved and cleared findings are removed from the outlier total.</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 14, marginBottom: 24 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 14, marginBottom: 24 }}>
                 {[
-                  { label: 'Surveys pulled', value: dashboard?.total_survey_count ?? 0, accent: '#1d4ed8' },
-                  { label: 'Good surveys', value: dashboard?.good_survey_count ?? 0, accent: '#059669' },
-                  { label: 'Active outliers', value: dashboard?.outlier_survey_count ?? 0, accent: '#dc2626' },
-                  { label: 'Pending review', value: dashboard?.pending_review_count ?? 0, accent: '#059669' },
+                  { label: 'Total data pulled', value: dashboard?.raw_submission_count ?? 0, accent: '#1d4ed8' },
                   { label: 'High severity', value: dashboard?.high_severity_count ?? 0, accent: '#d97706' },
                   { label: 'Medium severity', value: dashboard?.medium_severity_count ?? 0, accent: '#f59e0b' },
+                  { label: 'Total reviewed', value: dashboard?.total_reviewed_count ?? 0, accent: '#059669' },
                 ].map((metric) => (
                   <div key={metric.label} style={{ background: '#f8fafc', borderRadius: 16, padding: 18 }}>
                     <div style={{ fontSize: 13, fontWeight: 700, color: '#6b7280', marginBottom: 10 }}>{metric.label}</div>
@@ -1059,7 +1169,7 @@ function App() {
               </div>}
             </div>
 
-            <div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+            {false && <><div style={{ background: '#ffffff', borderRadius: 18, padding: 24, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
               <h2 style={{ marginTop: 0 }}>Staff management</h2>
               <form onSubmit={handleCreateStaff} style={{ display: 'grid', gap: 14, marginBottom: 18 }}>
                 <input
@@ -1147,20 +1257,19 @@ function App() {
                   ))
                 )}
               </div>
-            </div>
+            </div></>}
           </section>
         ) : (
           <>
             <section
           style={{
-            display: 'grid',
-            gridTemplateColumns: '1.15fr 0.85fr',
+            display: 'block',
             gap: 24,
             alignItems: 'stretch',
             marginBottom: 24,
           }}
         >
-          <div
+          {false && <div
             style={{
               background: 'linear-gradient(135deg, #0f172a, #2563eb)',
               color: 'white',
@@ -1176,23 +1285,22 @@ function App() {
             <p style={{ fontSize: 16, lineHeight: 1.6, maxWidth: 640, marginBottom: 20, opacity: 0.95 }}>
               Monitor imported SurveyCTO records, track QC rule outcomes, and resolve review issues from one central workspace.
             </p>
-            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+            {false && <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
               <button style={{ padding: '12px 16px', borderRadius: 12, border: 'none', background: '#ffffff', color: '#1d4ed8', fontWeight: 700, cursor: 'pointer' }}>
                 Open Queue
               </button>
               <button style={{ padding: '12px 16px', borderRadius: 12, border: '1px solid rgba(255,255,255,0.45)', background: 'transparent', color: '#ffffff', fontWeight: 700, cursor: 'pointer' }}>
                 View Workflow
               </button>
-            </div>
-          </div>
+            </div>}
+          </div>}
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 14 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 14 }}>
             {[
               { label: 'Total issues', value: dashboard?.issue_count ?? stats.total, accent: '#1d4ed8' },
               { label: 'High severity', value: dashboard?.high_severity_count ?? stats.highSeverity, accent: '#dc2626' },
               { label: 'Medium severity', value: dashboard?.medium_severity_count ?? stats.mediumSeverity, accent: '#f59e0b' },
               { label: 'Pending review', value: dashboard?.pending_review_count ?? stats.pending, accent: '#059669' },
-              { label: 'Last data pull', value: dashboard?.last_sync_at ? formatDate(dashboard.last_sync_at) : 'Not yet pulled', accent: '#2563eb' },
             ].map((card) => (
               <div key={card.label} style={{ background: '#ffffff', borderRadius: 16, padding: 18, boxShadow: '0 8px 30px rgba(15, 23, 42, 0.08)' }}>
                 <div style={{ fontSize: 13, fontWeight: 700, color: '#6b7280', marginBottom: 10 }}>{card.label}</div>
@@ -1202,7 +1310,7 @@ function App() {
           </div>
         </section>
 
-        <section style={{ marginBottom: 24, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 14 }}>
+        {false && <section style={{ marginBottom: 24, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 14 }}>
           {workflowSteps.map((step) => (
             <div key={step.title} style={{ background: '#ffffff', borderRadius: 16, padding: 18, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
               <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '6px 10px', borderRadius: 999, background: '#dbeafe', color: '#1d4ed8', fontSize: 12, fontWeight: 700 }}>
@@ -1211,10 +1319,10 @@ function App() {
               <p style={{ marginTop: 12, color: '#4b5563', lineHeight: 1.5 }}>{step.description}</p>
             </div>
           ))}
-        </section>
+        </section>}
 
         <section style={{ display: 'grid', gridTemplateColumns: '1fr 1.25fr', gap: 24 }}>
-          {sessionRole === 'admin' && !selectedIssue && <div style={{ background: '#ffffff', borderRadius: 18, padding: 18, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
+          {false && sessionRole === 'admin' && !selectedIssue && <div style={{ background: '#ffffff', borderRadius: 18, padding: 18, boxShadow: '0 8px 28px rgba(15, 23, 42, 0.06)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
               <h2 style={{ margin: 0 }}>Raw SurveyCTO Pulls</h2>
               <span style={{ color: '#6b7280', fontSize: 14 }}>{rawImports.length} items</span>
@@ -1297,22 +1405,22 @@ function App() {
                 </div>
                 {Object.keys(selectedIssue.context || {}).length > 0 && <div style={{ background: '#f8fafc', borderRadius: 12, padding: 14 }}>
                   <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 10 }}>Interview context</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>{Object.entries(selectedIssue.context).map(([label, value]) => <div key={label}><div style={{ fontSize: 11, color: '#64748b' }}>{label}</div><div style={{ fontWeight: 700, overflowWrap: 'anywhere' }}>{value}</div></div>)}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>{Object.entries(selectedIssue.context).map(([label, value]) => <div key={label}><div style={{ fontSize: 11, color: '#64748b' }}>{label}</div>{label === 'Related submission keys' ? <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 5 }}>{String(value).split(',').map((key) => key.trim()).filter(Boolean).map((key) => <button key={key} onClick={() => openRawSubmission(key)} style={{ padding: '5px 7px', border: '1px solid #bfdbfe', borderRadius: 7, background: '#eff6ff', color: '#1d4ed8', cursor: 'pointer', fontSize: 11, fontWeight: 700 }}>{key}</button>)}</div> : <div style={{ fontWeight: 700, overflowWrap: 'anywhere' }}>{value}</div>}</div>)}</div>
                 </div>}
                 <div style={{ padding: 14, borderRadius: 12, background: '#eff6ff', color: '#1e3a5f', lineHeight: 1.55 }}>
                   <strong>Recommended next check</strong><div style={{ marginTop: 5 }}>{splitQCReport(selectedIssue.evidence).nextCheck || <>Confirm the evidence against the submission, check whether this is a legitimate field condition, then assign a reviewer or record the resolution. This flag is <strong>{selectedIssue.severity}</strong> severity.</>}</div>
                 </div>
                 <div style={{ display: 'grid', gap: 6 }}>
-                  <label htmlFor="issue-assignee" style={{ fontSize: 12, color: '#6b7280', fontWeight: 700 }}>Assign reviewer</label>
-                  <select id="issue-assignee" value={selectedIssue.assigned_to_user_id || ''} onChange={(event) => assignIssue(selectedIssue.issue_id, event.target.value)} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', background: '#fff' }}>
+                  {sessionRole === 'admin' && <label htmlFor="issue-assignee" style={{ fontSize: 12, color: '#6b7280', fontWeight: 700 }}>Assign reviewer</label>}
+                  {sessionRole === 'admin' && <select id="issue-assignee" value={selectedIssue.assigned_to_user_id || ''} onChange={(event) => assignIssue(selectedIssue.issue_id, event.target.value)} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', background: '#fff' }}>
                     <option value="">Unassigned</option>
                     {staffMembers.map((member) => <option key={member.staff_id} value={member.staff_id}>{member.username} — {member.role}</option>)}
-                  </select>
+                  </select>}
                   {sessionRole === 'admin' ? <>
                     <label htmlFor="assignment-remark" style={{ fontSize: 12, color: '#6b7280', fontWeight: 700, marginTop: 4 }}>Assignment remark (visible to assigned staff)</label>
                     <textarea id="assignment-remark" maxLength={1000} value={selectedIssue.assignment_remark || ''} onChange={(event) => setSelectedIssue((current) => ({ ...current, assignment_remark: event.target.value }))} placeholder="Add short context or instructions for this task" rows={3} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', resize: 'vertical', fontFamily: 'inherit' }} />
                     <button onClick={() => assignIssue(selectedIssue.issue_id, selectedIssue.assigned_to_user_id, selectedIssue.assignment_remark)} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', cursor: 'pointer', fontWeight: 800 }}>Save assignment and remark</button>
-                  </> : <div style={{ background: '#fff7ed', borderRadius: 10, padding: 12, color: '#9a3412' }}><strong>Admin remark</strong><div style={{ marginTop: 4 }}>{selectedIssue.assignment_remark || 'No additional instructions were added.'}</div></div>}
+                  </> : <><div style={{ background: '#fff7ed', borderRadius: 10, padding: 12, color: '#9a3412' }}><strong>Admin instruction</strong><div style={{ marginTop: 4 }}>{selectedIssue.assignment_remark || 'No additional instructions were added.'}</div></div><label htmlFor="review-remark" style={{ fontSize: 12, color: '#6b7280', fontWeight: 700, marginTop: 4 }}>Your remark for the admin</label><textarea id="review-remark" maxLength={1000} value={selectedIssue.resolution_note || ''} onChange={(event) => setSelectedIssue((current) => ({ ...current, resolution_note: event.target.value }))} placeholder="Explain your decision or what needs further investigation" rows={4} style={{ padding: '10px 12px', borderRadius: 10, border: '1px solid #cbd5e1', resize: 'vertical', fontFamily: 'inherit' }} /></>}
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
                   <div style={{ background: '#f8fafc', borderRadius: 12, padding: 12 }}>
@@ -1342,8 +1450,9 @@ function App() {
                 </div>
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                   <button onClick={() => updateIssueStatus('in_progress')} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#dbeafe', color: '#155dc4', cursor: 'pointer', fontWeight: 800 }}>Start review</button>
-                  <button onClick={() => updateIssueStatus('resolved')} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#dcfce7', color: '#166534', cursor: 'pointer', fontWeight: 800 }}>Resolve with note</button>
-                  <button onClick={() => updateIssueStatus('rejected')} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#f1f5f9', color: '#475569', cursor: 'pointer', fontWeight: 800 }}>Mark not an issue</button>
+                  <button onClick={() => updateIssueStatus('approved')} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#dcfce7', color: '#166534', cursor: 'pointer', fontWeight: 800 }}>Approve</button>
+                  <button onClick={() => updateIssueStatus('needs_investigation')} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#fef3c7', color: '#92400e', cursor: 'pointer', fontWeight: 800 }}>Needs investigation</button>
+                  <button onClick={() => updateIssueStatus('rejected')} style={{ padding: '10px 12px', border: 0, borderRadius: 9, background: '#f1f5f9', color: '#475569', cursor: 'pointer', fontWeight: 800 }}>Reject flag</button>
                 </div>
               </div>
             ) : (
